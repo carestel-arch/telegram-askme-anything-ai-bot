@@ -11,21 +11,21 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-HF_TEXT_API = "https://api-inference.huggingface.co/models/google/flan-t5-base"
+HF_TEXT_API = "https://api-inference.huggingface.co/models/bigscience/bloom-560m"
 HF_IMAGE_API = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2"
 
-headers = {
-    "Authorization": f"Bearer {HF_TOKEN}"
-}
+headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
+# ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! I’m **StarAI Bot** ✨\n"
+        "👋 Hi! I’m StarAI Bot ✨\n"
         "I can answer questions and create images.\n\n"
         "🧠 Just type a question\n"
         "🖼️ Use /image <describe the image>"
     )
 
+# ---------- Text AI ----------
 async def chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = {"inputs": update.message.text}
     try:
@@ -37,6 +37,7 @@ async def chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(e)
         await update.message.reply_text("⚠️ I couldn’t answer that right now.")
 
+# ---------- Image AI ----------
 async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args)
     if not prompt:
@@ -51,6 +52,7 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(e)
         await update.message.reply_text("⚠️ Image generation failed.")
 
+# ---------- Build bot ----------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("image", image_cmd))
