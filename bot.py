@@ -1,70 +1,183 @@
 import os
 import logging
-import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from groq import Groq
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
+# ========================
+# SETUP LOGGING
+# ========================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+# ========================
+# GET API KEYS
+# ========================
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
-# ---------- Hugging Face Inference API URLs ----------
-# Small, hosted models for free usage
-HF_TEXT_API = "https://api-inference.huggingface.co/models/google/flan-t5-small"
-HF_IMAGE_API = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2"  # hosted model
+# Check if keys exist
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN not found! Set it in Heroku Config Vars")
+if not GROQ_API_KEY:
+    logger.error("❌ GROQ_API_KEY not found! Set it in Heroku Config Vars")
 
-headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+# ========================
+# INITIALIZE GROQ CLIENT
+# ========================
+client = Groq(api_key=GROQ_API_KEY)
 
-# ---------- /start ----------
+# ========================
+# BOT COMMANDS
+# ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Hi! I’m StarAI Bot ✨\n"
-        "I can answer questions and create images.\n\n"
-        "🧠 Just type a question\n"
-        "🖼️ Use /image <describe the image>"
-    )
+    """Send welcome message when /start is issued."""
+    user = update.effective_user
+    welcome_text = f"""
+👋 Hello {user.first_name}! I'm your AI Assistant powered by Groq.
 
-# ---------- Text AI ----------
-async def chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    payload = {"inputs": user_text}
+⚡ **Features:**
+• Fast & free AI responses
+• Can answer questions
+• Help with writing, coding, ideas
+
+📝 **Try asking me:**
+• "Explain quantum computing simply"
+• "Write a poem about cats"
+• "Help me plan a trip to Paris"
+• "How do I learn Python?"
+
+Just type your question below! 😊
+    """
+    await update.message.reply_text(welcome_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send help message."""
+    help_text = """
+🤖 **Available Commands:**
+/start - Start the bot
+/help - Show this help message
+/about - About this bot
+
+💡 **Just type any question** and I'll answer it!
+
+⚡ Powered by Groq (Llama 3.1) - Fast & Free AI
+    """
+    await update.message.reply_text(help_text)
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send about message."""
+    about_text = """
+🤖 **Groq AI Telegram Bot**
+Version 1.0
+
+⚡ **Powered by:** Groq Cloud & Llama 3.1
+🎯 **Features:** Fast, free AI responses
+📊 **Limits:** 5,000 requests/day (free)
+
+🔧 **Created with:** Python, python-telegram-bot, Groq API
+
+💝 **Enjoy chatting!**
+    """
+    await update.message.reply_text(about_text)
+
+# ========================
+# HANDLE MESSAGES
+# ========================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages."""
     try:
-        r = requests.post(HF_TEXT_API, headers=headers, json=payload, timeout=20)
-        data = r.json()
-        answer = data[0].get("generated_text", "⚠️ I couldn't generate an answer.")
-        await update.message.reply_text(answer)
+        user_message = update.message.text
+        user_id = update.effective_user.id
+        
+        logger.info(f"📨 User {user_id}: {user_message[:50]}...")
+        
+        # Show "typing..." indicator
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing"
+        )
+        
+        # Get response from Groq
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful Telegram bot assistant. Keep responses concise, friendly, and helpful. If asked who you are, say you're a Telegram bot powered by Groq's AI."
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+            model="llama-3.1-8b-instant",  # FREE and super fast!
+            temperature=0.7,
+            max_tokens=500,
+            top_p=1,
+            stream=False
+        )
+        
+        # Get the response text
+        bot_reply = chat_completion.choices[0].message.content
+        
+        # Send the response
+        await update.message.reply_text(bot_reply)
+        
+        logger.info(f"✅ Replied to user {user_id}")
+        
     except Exception as e:
-        logger.error(f"Text AI error: {e}")
-        await update.message.reply_text("⚠️ I couldn’t answer that right now.")
+        logger.error(f"❌ Error: {e}")
+        error_message = "Sorry, I encountered an error. Please try again in a moment."
+        await update.message.reply_text(error_message)
 
-# ---------- Image AI ----------
-async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args)
-    if not prompt:
-        await update.message.reply_text("Use it like: /image a cat wearing sunglasses")
+# ========================
+# ERROR HANDLER
+# ========================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors."""
+    logger.error(f"Update {update} caused error {context.error}")
+
+# ========================
+# MAIN FUNCTION
+# ========================
+def main():
+    """Start the bot."""
+    print("=" * 50)
+    print("🤖 Starting Groq Telegram Bot...")
+    print("=" * 50)
+    
+    # Check for API keys
+    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+        print("❌ ERROR: API keys not found!")
+        print("Please set TELEGRAM_TOKEN and GROQ_API_KEY environment variables")
+        print("On Heroku: Settings → Reveal Config Vars")
         return
-    payload = {"inputs": prompt}
-    try:
-        r = requests.post(HF_IMAGE_API, headers=headers, json=payload, timeout=60)
-        if r.status_code == 200:
-            with open("image.png", "wb") as f:
-                f.write(r.content)
-            await update.message.reply_photo(photo=open("image.png", "rb"))
-        else:
-            logger.error(f"Image API error: {r.status_code} {r.text}")
-            await update.message.reply_text("⚠️ Could not generate the image right now.")
-    except Exception as e:
-        logger.error(f"Image generation error: {e}")
-        await update.message.reply_text("⚠️ Image generation failed.")
+    
+    print("✅ API keys loaded successfully")
+    print("📱 Connecting to Telegram...")
+    
+    # Create Application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("about", about_command))
+    
+    # Add message handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    print("✅ Bot is running! Press Ctrl+C to stop")
+    print("=" * 50)
+    
+    application.run_polling()
 
-# ---------- Build bot ----------
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("image", image_cmd))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_reply))
-
-logger.info("Starting StarAI Bot...")
-app.run_polling()
+if __name__ == '__main__':
+    main()
