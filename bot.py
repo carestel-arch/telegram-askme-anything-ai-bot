@@ -1,55 +1,59 @@
 import os
 import logging
+import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
-import openai
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------- Logging ----------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Telegram token ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not found! Set it in Heroku Config Vars.")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
-# ---------- OpenAI API ----------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY not found! Set it in Heroku Config Vars.")
+HF_TEXT_API = "https://api-inference.huggingface.co/models/google/flan-t5-base"
+HF_IMAGE_API = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2"
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+headers = {
+    "Authorization": f"Bearer {HF_TOKEN}"
+}
 
-# ---------- /start command ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi 👋 I’m your AI bot. Ask me anything!")
-    logger.info(f"Replied to /start from {update.effective_user.username}")
+    await update.message.reply_text(
+        "👋 Hi! I’m **StarAI Bot** ✨\n"
+        "I can answer questions and create images.\n\n"
+        "🧠 Just type a question\n"
+        "🖼️ Use /image <describe the image>"
+    )
 
-# ---------- AI reply ----------
-async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+async def chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payload = {"inputs": update.message.text}
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful Telegram bot."},
-                {"role": "user", "content": user_text}
-            ]
-        )
-        answer = response.choices[0].message.content
+        r = requests.post(HF_TEXT_API, headers=headers, json=payload, timeout=30)
+        data = r.json()
+        answer = data[0]["generated_text"]
         await update.message.reply_text(answer)
-        logger.info(f"Replied to message: {user_text}")
     except Exception as e:
-        await update.message.reply_text("⚠️ Sorry, I couldn’t answer that.")
-        logger.error(f"AI Error: {e}")
+        logger.error(e)
+        await update.message.reply_text("⚠️ I couldn’t answer that right now.")
 
-# ---------- Build bot ----------
+async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("Use it like: /image a cat wearing sunglasses")
+        return
+    try:
+        r = requests.post(HF_IMAGE_API, headers=headers, json={"inputs": prompt}, timeout=60)
+        with open("image.png", "wb") as f:
+            f.write(r.content)
+        await update.message.reply_photo(photo=open("image.png", "rb"))
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text("⚠️ Image generation failed.")
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+app.add_handler(CommandHandler("image", image_cmd))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_reply))
 
-logger.info("Starting the bot...")
 app.run_polling()
