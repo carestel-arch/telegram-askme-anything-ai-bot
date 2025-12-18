@@ -1,16 +1,22 @@
 import os
+import io
 import json
+import requests
 import logging
+import random
+import tempfile
 from datetime import datetime
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler
+    ContextTypes, CallbackQueryHandler
 )
 from groq import Groq
+from PIL import Image
+from youtubesearchpython import VideosSearch
 
 # ========================
-# SETUP
+# SETUP & CONFIGURATION
 # ========================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,43 +24,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Keys
+# API Keys (set these in Heroku Config Vars)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
-# Initialize Groq
+# Initialize Groq AI
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Conversation memory (simple in-memory store)
+# Conversation memory
 user_conversations = {}
 
 # ========================
 # CONVERSATION MANAGEMENT
 # ========================
 def get_user_conversation(user_id):
-    """Get or create conversation history for user"""
+    """Get or create conversation history"""
     if user_id not in user_conversations:
         user_conversations[user_id] = [
             {
                 "role": "system",
-                "content": """You are StarAI, a friendly, intelligent AI assistant.
+                "content": """You are StarAI, a friendly, intelligent AI assistant with personality.
                 
-                Personality: Warm, helpful, empathetic, knowledgeable, and engaging.
+                PERSONALITY: Warm, empathetic, knowledgeable, engaging, supportive.
                 
-                Capabilities:
-                1. Answer any question with depth and insight
-                2. Engage in natural, human-like conversations
-                3. Show empathy and understanding
-                4. Provide thoughtful explanations
-                5. Remember conversation context
-                6. Be creative and engaging
+                CAPABILITIES:
+                1. Have natural human-like conversations
+                2. Answer any question thoughtfully
+                3. Provide emotional support
+                4. Explain complex concepts simply
+                5. Generate creative content
+                6. Remember conversation context
                 
-                Guidelines:
-                - Be conversational, not robotic
-                - Use emojis appropriately 😊
-                - Show genuine interest in the user
-                - Provide detailed, helpful responses
-                - Admit when you don't know something
+                SPECIAL FEATURES:
+                - Can create images (/image command)
+                - Can find music (/music command)
+                - Can tell jokes, facts, quotes
+                - Engages naturally with users
+                
+                RESPONSE STYLE:
+                - Use natural language with emojis 😊
+                - Be warm and engaging
+                - Show genuine interest
                 - Keep responses under 500 words
                 
                 Current Date: December 2024"""
@@ -67,272 +77,443 @@ def update_conversation(user_id, role, content):
     conversation = get_user_conversation(user_id)
     conversation.append({"role": role, "content": content})
     
-    # Keep only last 10 messages to manage memory
-    if len(conversation) > 20:
-        conversation = [conversation[0]] + conversation[-19:]
-        user_conversations[user_id] = conversation
+    # Keep only last 15 messages
+    if len(conversation) > 16:
+        conversation = [conversation[0]] + conversation[-15:]
 
 def clear_conversation(user_id):
-    """Clear user's conversation history"""
+    """Clear conversation memory"""
     if user_id in user_conversations:
         del user_conversations[user_id]
 
 # ========================
-# AI RESPONSE GENERATION
+# IMAGE GENERATION
 # ========================
-def generate_ai_response(user_id, user_message):
-    """Generate AI response using Groq"""
+def generate_image(prompt):
+    """Generate images using free APIs"""
     try:
-        if not client:
-            return "AI service is currently unavailable. Please try again later."
+        # Method 1: Pollinations.ai (free)
+        poll_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=512&height=512"
+        response = requests.get(poll_url, timeout=15)
         
-        # Get conversation history
-        conversation = get_user_conversation(user_id)
+        if response.status_code == 200:
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp.write(response.content)
+                return tmp.name
         
-        # Add user message to history
-        conversation.append({"role": "user", "content": user_message})
-        
-        # Generate response
-        response = client.chat.completions.create(
-            messages=conversation,
-            model="llama-3.1-8b-instant",
-            temperature=0.8,
-            max_tokens=800,
-            top_p=0.9,
-            frequency_penalty=0.1,
-            presence_penalty=0.1
-        )
-        
-        ai_response = response.choices[0].message.content
-        
-        # Add AI response to conversation history
-        conversation.append({"role": "assistant", "content": ai_response})
-        
-        return ai_response
-        
+        # Method 2: Placeholder with text
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            # Create simple image
+            img = Image.new('RGB', (400, 400), color=(73, 109, 137))
+            
+            # Add text (simplified)
+            from PIL import ImageDraw, ImageFont
+            draw = ImageDraw.Draw(img)
+            
+            # Simple text
+            text = prompt[:30] if len(prompt) > 30 else prompt
+            draw.text((50, 180), f"StarAI:\n{text}", fill=(255, 255, 255))
+            
+            img.save(tmp.name, 'PNG')
+            return tmp.name
+            
     except Exception as e:
-        logger.error(f"AI generation error: {e}")
-        return get_fallback_response(user_message)
-
-def get_fallback_response(user_message):
-    """Fallback responses for when AI fails"""
-    user_lower = user_message.lower()
-    
-    # Greetings
-    greetings = ["hi", "hello", "hey", "hola", "greetings"]
-    if any(greet in user_lower for greet in greetings):
-        return "👋 Hello! I'm StarAI! How can I help you today?"
-    
-    # Common questions
-    if "love" in user_lower:
-        return """💖 Love is a complex mix of emotions, behaviors, and beliefs associated with strong feelings of affection, protectiveness, warmth, and respect for another person.
-
-It can be:
-• Romantic love (between partners)
-• Familial love (family bonds)
-• Platonic love (friendship)
-• Self-love (caring for oneself)
-
-Love involves care, intimacy, protection, attraction, and trust. It's one of the most profound human experiences! 😊"""
-    
-    if "president" in user_lower:
-        return """🇺🇸 For current political leadership information:
-• US President: Check official whitehouse.gov
-• Other countries: Visit their government websites
-• Latest elections: Follow reliable news sources
-
-I can help explain political systems or how elections work!"""
-    
-    if "how are you" in user_lower:
-        return "🌟 I'm doing great, thank you for asking! I'm here and ready to help you with anything. How about you?"
-    
-    if "your name" in user_lower:
-        return "✨ I'm StarAI! Your friendly AI assistant. Nice to meet you! 😊"
-    
-    if "help" in user_lower:
-        return "🤝 I'm here to help! You can ask me about anything: science, technology, relationships, philosophy, current events, or just chat!"
-    
-    # Default fallback
-    return """✨ I'd love to help with that! Could you please rephrase your question or provide more details?
-
-💡 **Examples of what I can help with:**
-• "Explain quantum physics simply"
-• "What are the latest space discoveries?"
-• "How do I deal with stress?"
-• "Tell me a fun fact!"
-• "Can you help me plan my day?"
-
-Ask me anything! I'm here for you. 😊"""
+        logger.error(f"Image error: {e}")
+        return None
 
 # ========================
-# SPECIAL FEATURES
+# MUSIC SEARCH
 # ========================
-def get_current_info(query):
-    """Get current information when needed"""
-    import requests
-    
-    query_lower = query.lower()
-    
-    # Weather requests
-    weather_words = ["weather", "temperature", "forecast", "rain", "sunny"]
-    if any(word in query_lower for word in weather_words):
-        return "🌤️ For current weather, I recommend checking:\n• weather.com\n• accuweather.com\n• your local weather service\n\nI can explain weather patterns or climate science though!"
-    
-    # News requests
-    news_words = ["news", "current events", "latest", "today", "update"]
-    if any(word in query_lower for word in news_words):
-        return "📰 For latest news, check:\n• BBC News\n• Reuters\n• Associated Press\n• CNN\n• Al Jazeera\n\nI can discuss news topics or explain current events!"
-    
-    # Time requests
-    if "time" in query_lower:
-        current_time = datetime.now().strftime("%I:%M %p")
-        return f"🕰️ My system time is: {current_time} (UTC)\n\nFor your local time, check your device clock! 😊"
-    
-    # Date requests
-    if "date" in query_lower or "day today" in query_lower:
-        current_date = datetime.now().strftime("%B %d, %Y")
-        return f"📅 Today is: {current_date}"
-    
-    return None
+def search_music(query):
+    """Search for music on YouTube"""
+    try:
+        videos_search = VideosSearch(query, limit=3)
+        results = videos_search.result()['result']
+        
+        music_list = []
+        for i, video in enumerate(results[:3], 1):
+            title = video['title'][:50]
+            url = video['link']
+            duration = video.get('duration', 'N/A')
+            music_list.append(f"{i}. 🎵 {title}\n   ⏱️ {duration}\n   🔗 {url}")
+        
+        return music_list
+    except:
+        return ["Use: /music <song or artist>"]
+
+# ========================
+# FUN CONTENT
+# ========================
+JOKES = [
+    "😂 Why don't scientists trust atoms? Because they make up everything!",
+    "😄 Why did the scarecrow win an award? Because he was outstanding in his field!",
+    "🤣 What do you call a fake noodle? An impasta!",
+    "😆 Why did the math book look so sad? Because it had too many problems!",
+    "😊 How does the moon cut his hair? Eclipse it!",
+]
+
+FACTS = [
+    "🐝 Honey never spoils! Archaeologists have found 3000-year-old honey that's still edible.",
+    "🧠 Octopuses have three hearts! Two pump blood to gills, one to the body.",
+    "🌊 The shortest war was Britain-Zanzibar in 1896. It lasted 38 minutes!",
+    "🐌 Snails can sleep for up to three years when hibernating.",
+    "🦒 A giraffe's neck has the same number of vertebrae as humans: seven!",
+]
+
+QUOTES = [
+    "🌟 'The only way to do great work is to love what you do.' - Steve Jobs",
+    "💫 'Your time is limited, don't waste it living someone else's life.' - Steve Jobs",
+    "🚀 'The future belongs to those who believe in the beauty of their dreams.' - Eleanor Roosevelt",
+    "🌱 'The only impossible journey is the one you never begin.' - Tony Robbins",
+    "💖 'Be yourself; everyone else is already taken.' - Oscar Wilde",
+]
 
 # ========================
 # BOT COMMANDS
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command with beautiful welcome"""
+    """Start command with interactive buttons"""
     user = update.effective_user
     
     welcome = f"""
-🌟 *WELCOME TO STARAI, {user.first_name}!* 🌟
+🌟 *WELCOME TO STARAI v2.0, {user.first_name}!* 🌟
 
-✨ *Your Intelligent Companion for Everything*
+✨ *Your Complete AI Companion*
 
-💬 **I'm not just a bot - I'm your AI friend who can:**
-• Have meaningful conversations
-• Answer ANY question thoughtfully
-• Provide emotional support
-• Explain complex concepts simply
-• Help with decisions and ideas
-• Share knowledge and insights
+🎨 **CREATE:**
+• Images from text
+• Art and designs
+• Visual content
 
-🎭 **Talk to me about:**
-• Life, love, and relationships 💖
-• Science and technology 🔬
-• Philosophy and meaning 🤔
-• Current events and news 📰
-• Personal growth and goals 🌱
-• Fun facts and trivia 🎯
+🎵 **MUSIC:**
+• Find songs & artists
+• Get YouTube links
+• Discover new music
 
-🤝 **How to interact:**
-• Just talk naturally - like texting a friend!
-• Ask deep or simple questions
-• Share your thoughts and feelings
-• Request explanations or advice
-• Say "help" if you're unsure
+💬 **CHAT:**
+• Natural conversations
+• Emotional support
+• Learning & knowledge
+• Deep discussions
 
-💡 **Try saying:**
-"Hi StarAI!"
-"What is the meaning of life?"
-"Can you explain quantum physics?"
-"I'm feeling stressed, any advice?"
-"Tell me something interesting!"
+🎭 **FUN:**
+• Jokes & humor
+• Cool facts
+• Inspiring quotes
+• Entertainment
 
-*I'm here to listen, help, and engage. Let's have a wonderful conversation!* 💫
+🔧 **COMMANDS:**
+/image <text> - Generate images
+/music <song> - Find music
+/joke - Get a joke
+/fact - Learn a fact
+/quote - Inspiration
+/clear - Reset chat
+/help - All commands
 
-*Type anything to begin...* 😊
+*Tap buttons below or type commands!* 🚀
     """
     
-    # Clear previous conversation
+    # Clear old conversation
     clear_conversation(user.id)
     
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    # Create buttons
+    keyboard = [
+        [InlineKeyboardButton("🎨 Create Image", callback_data='create_image'),
+         InlineKeyboardButton("🎵 Find Music", callback_data='find_music')],
+        [InlineKeyboardButton("😂 Get Joke", callback_data='get_joke'),
+         InlineKeyboardButton("💡 Get Fact", callback_data='get_fact')],
+        [InlineKeyboardButton("📜 Get Quote", callback_data='get_quote'),
+         InlineKeyboardButton("🆘 Help", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command"""
     help_text = """
-🆘 *StarAI Help Center*
+🆘 *STARAI HELP CENTER*
 
-💬 **How to use me:**
-Just talk to me like a human friend! I understand natural language.
+🎨 **MEDIA COMMANDS:**
+/image <description> - Generate AI image
+/music <song/artist> - Find music links
+/meme - Get fun images
 
-🌟 **What I can do:**
-• Answer questions on any topic
-• Provide emotional support
-• Explain complex ideas simply
-• Help with problem-solving
-• Engage in deep conversations
-• Share knowledge and insights
+💬 **CHAT COMMANDS:**
+/start - Welcome message
+/help - This help
+/clear - Reset conversation
+/about - About StarAI
 
-🎯 **Conversation starters:**
-"Hi! How are you?"
-"What's your opinion on AI?"
-"Can you help me understand something?"
-"Tell me a story"
-"What should I learn today?"
+🎭 **FUN COMMANDS:**
+/joke - Get a joke
+/fact - Learn a fact  
+/quote - Inspiring quote
 
-⚡ **Commands:**
-/start - Begin fresh conversation
-/help - This help message
-/clear - Clear our conversation memory
-/about - Learn about StarAI
+🤖 **NATURAL LANGUAGE:**
+You can also say:
+• "Create an image of a dragon"
+• "Find music by Taylor Swift"
+• "Tell me a joke"
+• "Explain quantum physics"
+• "I need advice"
 
-🔍 **For current information:**
-I'll guide you to reliable sources for news, weather, stock prices, etc.
-
-*Remember: I'm here for YOU. Don't hesitate to ask anything!* 💝
+*Just talk to me naturally!* 😊
     """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """About StarAI"""
     about_text = """
-🤖 *About StarAI*
+🤖 *ABOUT STARAI v2.0*
 
-✨ **Version:** Human-like AI Assistant
+✨ **Version:** Complete AI Assistant
 
-💝 **My Purpose:**
-To be a compassionate, intelligent companion who makes knowledge accessible and conversations meaningful.
+💝 **Mission:**
+To be your intelligent companion for creativity, knowledge, and conversation.
 
 🧠 **Powered by:**
-• Groq AI (Llama 3.1) for intelligent responses
+• Groq AI for intelligent conversations
+• Multiple APIs for media creation
 • Natural language understanding
-• Conversational memory
-• Emotional intelligence algorithms
 
-🌟 **My Personality:**
-Warm, empathetic, curious, knowledgeable, and genuinely interested in helping you.
-
-🎯 **What Makes Me Different:**
-1. *Human-like conversations* - I don't just answer, I engage
-2. *Emotional intelligence* - I understand feelings
-3. *Depth over speed* - Quality responses matter most
-4. *Continuous learning* - I adapt to your style
-5. *No judgment zone* - You can ask anything
+🌟 **Features:**
+✅ Human-like conversations
+✅ Image generation
+✅ Music discovery
+✅ Emotional intelligence
+✅ Learning & teaching
+✅ Fun & entertainment
 
 🔧 **Technology:**
-Built with Python, Telegram Bot API, and advanced AI models.
+• Python & Telegram Bot API
+• Advanced AI models
+• Real-time processing
+• Cloud deployment
 
-💫 **Philosophy:**
-"To illuminate minds and touch hearts through conversation."
-
-*StarAI - More than an assistant, a companion in your journey.* 🌟
+*StarAI - More than a bot, a companion!* 💫
     """
     await update.message.reply_text(about_text, parse_mode="Markdown")
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate image from text"""
+    prompt = ' '.join(context.args)
+    
+    if not prompt:
+        await update.message.reply_text(
+            "🎨 *Usage:* /image <description>\n\n"
+            "Examples:\n• /image sunset over mountains\n• /image cute cat in space\n• /image futuristic city",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await update.message.reply_text(f"🎨 *Creating:* {prompt}\n\nPlease wait...", parse_mode="Markdown")
+    
+    image_path = generate_image(prompt)
+    
+    if image_path:
+        try:
+            with open(image_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=f"✨ *Generated:* {prompt}\n*Created by StarAI* 🎨",
+                    parse_mode="Markdown"
+                )
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(image_path)
+            except:
+                pass
+    else:
+        await update.message.reply_text(
+            "❌ *Image creation failed.*\n\nTry:\n• Simpler description\n• Different keywords\n• Or try again later",
+            parse_mode="Markdown"
+        )
+
+async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for music"""
+    query = ' '.join(context.args)
+    
+    if not query:
+        await update.message.reply_text(
+            "🎵 *Usage:* /music <song or artist>\n\n"
+            "Examples:\n• /music Bohemian Rhapsody\n• /music Taylor Swift\n• /music classical music",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await update.message.reply_text(f"🔍 *Searching:* {query}", parse_mode="Markdown")
+    
+    results = search_music(query)
+    
+    response = "🎶 *Music Results:*\n\n"
+    for result in results:
+        response += f"{result}\n\n"
+    
+    response += "💡 *Note:* These are YouTube links for legal listening."
+    
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tell a joke"""
+    joke = random.choice(JOKES)
+    await update.message.reply_text(f"😂 *Joke:*\n\n{joke}", parse_mode="Markdown")
+
+async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a fun fact"""
+    fact = random.choice(FACTS)
+    await update.message.reply_text(f"💡 *Did you know?*\n\n{fact}", parse_mode="Markdown")
+
+async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share inspirational quote"""
+    quote = random.choice(QUOTES)
+    await update.message.reply_text(f"📜 *Quote:*\n\n{quote}", parse_mode="Markdown")
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear conversation memory"""
     user = update.effective_user
     clear_conversation(user.id)
-    
     await update.message.reply_text(
-        "🧹 *Conversation cleared!*\n\n"
-        "I've forgotten our previous chat. Let's start fresh! 😊\n\n"
-        "Say hi or ask me anything!",
+        "🧹 *Conversation cleared!*\n\nLet's start fresh! 😊\nSay hi or ask me anything!",
         parse_mode="Markdown"
     )
 
+async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get a fun image"""
+    try:
+        # Get random image from Unsplash
+        response = requests.get("https://source.unsplash.com/random/400x400/?funny,meme,comedy", timeout=10)
+        
+        if response.status_code == 200:
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                tmp.write(response.content)
+                tmp_path = tmp.name
+            
+            with open(tmp_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption="😄 *Fun Image!*\nUse /image to create your own!",
+                    parse_mode="Markdown"
+                )
+            
+            # Clean up
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+        else:
+            await joke_command(update, context)
+            
+    except:
+        await update.message.reply_text(
+            "🎭 Need fun? Try:\n• /joke - For laughs\n• /image - Create memes\n• Just chat with me! 😊",
+            parse_mode="Markdown"
+        )
+
 # ========================
-# MESSAGE HANDLER - THE MAIN BRAIN
+# BUTTON HANDLERS
+# ========================
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button presses"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'create_image':
+        await query.edit_message_text(
+            "🎨 *Image Creation*\n\nSend: /image <description>\n\nExamples:\n• /image dragon in forest\n• /image cyberpunk city\n• /image cute puppy",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'find_music':
+        await query.edit_message_text(
+            "🎵 *Music Search*\n\nSend: /music <song or artist>\n\nExamples:\n• /music Imagine Dragons\n• /music chill lofi\n• /music 80s hits",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'get_joke':
+        await query.edit_message_text(f"😂 *Joke:*\n\n{random.choice(JOKES)}", parse_mode="Markdown")
+    elif query.data == 'get_fact':
+        await query.edit_message_text(f"💡 *Fact:*\n\n{random.choice(FACTS)}", parse_mode="Markdown")
+    elif query.data == 'get_quote':
+        await query.edit_message_text(f"📜 *Quote:*\n\n{random.choice(QUOTES)}", parse_mode="Markdown")
+    elif query.data == 'help':
+        await help_command(update, context)
+
+# ========================
+# AI RESPONSE GENERATOR
+# ========================
+def generate_ai_response(user_id, user_message):
+    """Generate intelligent AI response"""
+    try:
+        if not client:
+            return "🤖 *AI Service:* Currently unavailable. Try commands like /image or /music!"
+        
+        conversation = get_user_conversation(user_id)
+        conversation.append({"role": "user", "content": user_message})
+        
+        response = client.chat.completions.create(
+            messages=conversation,
+            model="llama-3.1-8b-instant",
+            temperature=0.8,
+            max_tokens=600
+        )
+        
+        ai_response = response.choices[0].message.content
+        conversation.append({"role": "assistant", "content": ai_response})
+        
+        return ai_response
+        
+    except Exception as e:
+        logger.error(f"AI error: {e}")
+        return get_fallback_response(user_message)
+
+def get_fallback_response(user_message):
+    """Fallback responses"""
+    user_lower = user_message.lower()
+    
+    # Greetings
+    greetings = {
+        "hi": "👋 Hello! I'm StarAI! How can I help you today? 😊",
+        "hello": "🌟 Hello there! Great to meet you! What would you like to chat about?",
+        "hey": "😄 Hey! I'm here and ready to help! Ask me anything!",
+        "how are you": "✨ I'm doing great, thanks for asking! Ready to assist you. How about you?",
+    }
+    
+    for key, response in greetings.items():
+        if key in user_lower:
+            return response
+    
+    # Common questions
+    if "love" in user_lower:
+        return """💖 *Love* is a complex mix of emotions including care, intimacy, protectiveness, and trust.
+
+Types of love:
+• Romantic ❤️
+• Familial 👨‍👩‍👧‍👦  
+• Platonic (friendship) 👫
+• Self-love 💝
+
+It's one of the most beautiful human experiences!"""
+    
+    if "president" in user_lower:
+        return """🇺🇸 For current leaders:
+• Check official government websites
+• Follow reliable news sources
+• I can explain political systems!"""
+    
+    # Default
+    return """✨ I'd love to help! You can:
+
+🎨 *Create images:* "Make an image of a sunset"
+🎵 *Find music:* "Play some jazz music"
+💬 *Chat naturally:* "Explain quantum physics"
+🎭 *Have fun:* "Tell me a joke"
+
+Or use commands: /image, /music, /joke, /help 😊"""
+
+# ========================
+# MAIN MESSAGE HANDLER
 # ========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages"""
@@ -340,7 +521,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         user_message = update.message.text
         
-        logger.info(f"User {user.id}: {user_message}")
+        logger.info(f"User {user.id}: {user_message[:50]}")
         
         # Show typing indicator
         await context.bot.send_chat_action(
@@ -348,10 +529,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action="typing"
         )
         
-        # Check for current info needs
-        current_info = get_current_info(user_message)
-        if current_info:
-            await update.message.reply_text(current_info, parse_mode="Markdown")
+        # Check for image requests
+        image_words = ["create image", "generate image", "draw", "paint", "picture of", "image of"]
+        if any(word in user_message.lower() for word in image_words):
+            prompt = user_message
+            for word in image_words:
+                if word in user_message.lower():
+                    prompt = user_message.lower().split(word)[-1].strip()
+                    break
+            
+            if not prompt or len(prompt) < 3:
+                prompt = "a beautiful artwork"
+            
+            await update.message.reply_text(f"🎨 Creating: {prompt}...")
+            image_path = generate_image(prompt)
+            
+            if image_path:
+                with open(image_path, 'rb') as photo:
+                    await update.message.reply_photo(
+                        photo=photo,
+                        caption=f"✨ *Created:* {prompt}\n*By StarAI* 🎨",
+                        parse_mode="Markdown"
+                    )
+                try:
+                    os.unlink(image_path)
+                except:
+                    pass
+            else:
+                await update.message.reply_text("Try: /image <description>")
+            return
+        
+        # Check for music requests
+        music_words = ["play music", "find song", "music by", "listen to", "song by"]
+        if any(word in user_message.lower() for word in music_words):
+            query = user_message
+            for word in music_words:
+                if word in user_message.lower():
+                    query = user_message.lower().split(word)[-1].strip()
+                    break
+            
+            if not query:
+                query = "popular music"
+            
+            await update.message.reply_text(f"🎵 Searching: {query}...")
+            results = search_music(query)
+            
+            response = "🎶 *Results:*\n\n"
+            for result in results:
+                response += f"{result}\n\n"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
             return
         
         # Generate AI response
@@ -360,68 +587,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send response
         await update.message.reply_text(ai_response, parse_mode="Markdown")
         
-        logger.info(f"Replied to user {user.id}")
-        
     except Exception as e:
         logger.error(f"Error: {e}")
-        error_response = """⚠️ *Oops! Something went wrong.*
-
-I encountered an error processing your message. Please:
-
-1. Try rephrasing your question
-2. Wait a moment and try again
-3. Use /clear to reset our conversation
-
-I'm still learning and appreciate your patience! 💫
-
-*In the meantime, here's a fun fact:* 
-Did you know honey never spoils? Archaeologists have found pots of honey in ancient Egyptian tombs that are over 3,000 years old and still perfectly good to eat! 🍯"""
-        
-        await update.message.reply_text(error_response, parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ *Error occurred.*\n\nTry:\n• /help for commands\n• Rephrase your message\n• I'm still learning! 😊",
+            parse_mode="Markdown"
+        )
 
 # ========================
 # MAIN FUNCTION
 # ========================
 def main():
-    """Start StarAI"""
+    """Start the bot"""
     print("=" * 50)
-    print("🤖 STARAI - HUMAN-LIKE AI STARTING")
+    print("🌟 STARAI v2.0 - COMPLETE AI ASSISTANT")
     print("=" * 50)
     
     # Check API keys
     if not TELEGRAM_TOKEN:
-        print("❌ ERROR: TELEGRAM_TOKEN not found!")
-        print("Add to Heroku Config Vars")
+        print("❌ ERROR: TELEGRAM_TOKEN missing!")
+        print("Add to Heroku: Settings → Config Vars")
         return
     
     if not GROQ_API_KEY:
-        print("❌ ERROR: GROQ_API_KEY not found!")
+        print("⚠️ WARNING: GROQ_API_KEY missing")
         print("Get FREE key: https://console.groq.com")
-        print("Add to Heroku Config Vars")
-        return
+        print("Chat features limited without it")
     
-    print("✅ Telegram token: Found")
-    print("✅ Groq API key: Found")
-    print("🤖 Initializing StarAI with conversation memory...")
+    print("✅ Starting StarAI with all features...")
     
     # Create application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("about", about_command))
-    application.add_handler(CommandHandler("clear", clear_command))
+    commands = [
+        ("start", start),
+        ("help", help_command),
+        ("about", about_command),
+        ("image", image_command),
+        ("music", music_command),
+        ("joke", joke_command),
+        ("fact", fact_command),
+        ("quote", quote_command),
+        ("clear", clear_command),
+        ("meme", meme_command),
+    ]
+    
+    for command, handler in commands:
+        app.add_handler(CommandHandler(command, handler))
+    
+    # Add button handler
+    app.add_handler(CallbackQueryHandler(button_callback))
     
     # Add message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("✅ StarAI is running with human-like intelligence!")
-    print("📱 Send /start to begin a conversation")
+    print("✅ StarAI v2.0 is running!")
+    print("📱 Features: AI Chat, Image Generation, Music Search, Fun Commands")
+    print("🔧 Send /start to begin")
     print("=" * 50)
     
     # Start bot
-    application.run_polling()
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
