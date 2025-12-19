@@ -32,19 +32,10 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
-# PayPal Configuration
+# PayPal Configuration (Optional)
 PAYPAL_CLIENT_ID = os.environ.get('PAYPAL_CLIENT_ID')
 PAYPAL_SECRET = os.environ.get('PAYPAL_SECRET')
-PAYPAL_WEBHOOK_ID = os.environ.get('PAYPAL_WEBHOOK_ID')
 PAYPAL_ENVIRONMENT = os.environ.get('PAYPAL_ENVIRONMENT', 'sandbox')
-
-# Determine PayPal API URLs
-if PAYPAL_ENVIRONMENT == 'live':
-    PAYPAL_API_BASE = 'https://api.paypal.com'
-    PAYPAL_WEBHOOK_URL = 'https://api.paypal.com'
-else:
-    PAYPAL_API_BASE = 'https://api.sandbox.paypal.com'
-    PAYPAL_WEBHOOK_URL = 'https://api.sandbox.paypal.com'
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN not set in environment variables")
@@ -59,125 +50,7 @@ ADMIN_IDS = os.environ.get('ADMIN_IDS', '').split(',')
 user_conversations = {}
 
 # ========================
-# PAYPAL HELPER FUNCTIONS
-# ========================
-def get_paypal_access_token():
-    """Get PayPal access token for API calls"""
-    try:
-        if not PAYPAL_CLIENT_ID or not PAYPAL_SECRET:
-            logger.error("PayPal credentials not configured")
-            return None
-        
-        auth_url = f"{PAYPAL_API_BASE}/v1/oauth2/token"
-        auth = (PAYPAL_CLIENT_ID, PAYPAL_SECRET)
-        headers = {"Accept": "application/json", "Accept-Language": "en_US"}
-        data = {"grant_type": "client_credentials"}
-        
-        response = requests.post(auth_url, auth=auth, headers=headers, data=data, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json().get('access_token')
-        else:
-            logger.error(f"PayPal auth failed: {response.status_code} - {response.text}")
-            return None
-    except Exception as e:
-        logger.error(f"PayPal token error: {e}")
-        return None
-
-def create_paypal_order(amount, user_id, description="StarAI Donation"):
-    """Create a PayPal order and return approval URL"""
-    try:
-        access_token = get_paypal_access_token()
-        if not access_token:
-            return None, "PayPal service unavailable"
-        
-        order_url = f"{PAYPAL_API_BASE}/v2/checkout/orders"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "PayPal-Request-Id": f"starai_{user_id}_{int(datetime.now().timestamp())}"
-        }
-        
-        order_data = {
-            "intent": "CAPTURE",
-            "purchase_units": [{
-                "amount": {
-                    "currency_code": "USD",
-                    "value": str(amount)
-                },
-                "description": description,
-                "custom_id": f"user_{user_id}"
-            }]
-        }
-        
-        response = requests.post(order_url, headers=headers, json=order_data, timeout=10)
-        
-        if response.status_code == 201:
-            order_data = response.json()
-            order_id = order_data.get('id')
-            
-            # Find approval link
-            for link in order_data.get('links', []):
-                if link.get('rel') == 'approve':
-                    approval_url = link.get('href')
-                    return order_id, approval_url
-            
-            return None, "No approval URL found"
-        else:
-            logger.error(f"PayPal order creation failed: {response.status_code} - {response.text}")
-            return None, f"Failed to create order: {response.text}"
-            
-    except Exception as e:
-        logger.error(f"PayPal order error: {e}")
-        return None, str(e)
-
-def capture_paypal_order(order_id):
-    """Capture a PayPal payment"""
-    try:
-        access_token = get_paypal_access_token()
-        if not access_token:
-            return False, "PayPal service unavailable"
-        
-        capture_url = f"{PAYPAL_API_BASE}/v2/checkout/orders/{order_id}/capture"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}"
-        }
-        
-        response = requests.post(capture_url, headers=headers, json={}, timeout=10)
-        
-        if response.status_code == 201:
-            capture_data = response.json()
-            status = capture_data.get('status')
-            
-            if status == 'COMPLETED':
-                # Extract payment details
-                purchase_unit = capture_data.get('purchase_units', [{}])[0]
-                payment = purchase_unit.get('payments', {}).get('captures', [{}])[0]
-                
-                transaction_id = payment.get('id', '')
-                amount = float(payment.get('amount', {}).get('value', 0))
-                payer = capture_data.get('payer', {})
-                
-                return True, {
-                    'status': 'COMPLETED',
-                    'transaction_id': transaction_id,
-                    'amount': amount,
-                    'payer_email': payer.get('email_address', ''),
-                    'payer_name': payer.get('name', {}).get('given_name', '')
-                }
-            else:
-                return False, f"Payment status: {status}"
-        else:
-            logger.error(f"PayPal capture failed: {response.status_code} - {response.text}")
-            return False, f"Capture failed: {response.text}"
-            
-    except Exception as e:
-        logger.error(f"PayPal capture error: {e}")
-        return False, str(e)
-
-# ========================
-# DONATION DATABASE (UPDATED FOR PAYPAL)
+# DONATION DATABASE
 # ========================
 class DonationDB:
     def __init__(self):
@@ -199,8 +72,7 @@ class DonationDB:
                     first_name TEXT,
                     amount REAL,
                     status TEXT DEFAULT 'pending',
-                    transaction_id TEXT UNIQUE,
-                    payment_method TEXT DEFAULT 'manual',
+                    transaction_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     verified_at TIMESTAMP
                 )
@@ -213,45 +85,26 @@ class DonationDB:
                     last_donation TIMESTAMP
                 )
             ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS paypal_orders (
-                    order_id TEXT PRIMARY KEY,
-                    user_id INTEGER,
-                    amount REAL,
-                    status TEXT DEFAULT 'created',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    captured_at TIMESTAMP
-                )
-            ''')
             conn.commit()
             conn.close()
             logger.info(f"✅ Database: {self.db_file}")
         except Exception as e:
             logger.error(f"❌ Database error: {e}")
     
-    def add_donation(self, user_id, username, first_name, amount, transaction_id="", payment_method="manual"):
+    def add_donation(self, user_id, username, first_name, amount, transaction_id=""):
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
-            
-            # Check if transaction already exists
-            cursor.execute('SELECT id FROM donations WHERE transaction_id = ?', (transaction_id,))
-            if cursor.fetchone():
-                conn.close()
-                return False, "Transaction already recorded"
-            
             cursor.execute('''
-                INSERT INTO donations (user_id, username, first_name, amount, transaction_id, payment_method)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, username, first_name, amount, transaction_id, payment_method))
+                INSERT INTO donations (user_id, username, first_name, amount, transaction_id)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, amount, transaction_id))
             conn.commit()
             conn.close()
-            return True, "Donation recorded"
-        except sqlite3.IntegrityError:
-            return False, "Transaction ID already exists"
+            return True
         except Exception as e:
             logger.error(f"❌ Add donation error: {e}")
-            return False, str(e)
+            return False
     
     def verify_donation(self, transaction_id):
         try:
@@ -279,55 +132,60 @@ class DonationDB:
             logger.error(f"❌ Verify donation error: {e}")
         return False
     
-    def add_paypal_order(self, order_id, user_id, amount):
+    def get_user_donations(self, user_id):
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO paypal_orders (order_id, user_id, amount)
-                VALUES (?, ?, ?)
-            ''', (order_id, user_id, amount))
-            conn.commit()
-            conn.close()
-            return True
-        except sqlite3.IntegrityError:
-            return False  # Order already exists
-        except Exception as e:
-            logger.error(f"❌ Add PayPal order error: {e}")
-            return False
-    
-    def update_paypal_order(self, order_id, status):
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE paypal_orders SET status = ? WHERE order_id = ?', (status, order_id))
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error(f"❌ Update PayPal order error: {e}")
-            return False
-    
-    def get_paypal_order(self, order_id):
-        try:
-            conn = sqlite3.connect(self.db_file)
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM paypal_orders WHERE order_id = ?', (order_id,))
-            order = cursor.fetchone()
+            cursor.execute('SELECT * FROM donations WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+            rows = cursor.fetchall()
             conn.close()
             
-            if order:
-                return {
-                    'order_id': order[0],
-                    'user_id': order[1],
-                    'amount': order[2],
-                    'status': order[3],
-                    'created_at': order[4],
-                    'captured_at': order[5]
-                }
+            donations = []
+            for row in rows:
+                donations.append({
+                    "id": row[0],
+                    "amount": row[4],
+                    "status": row[5],
+                    "transaction_id": row[6],
+                    "created_at": row[7],
+                    "verified_at": row[8]
+                })
+            return donations
         except Exception as e:
-            logger.error(f"❌ Get PayPal order error: {e}")
-        return None
+            logger.error(f"❌ Get donations error: {e}")
+            return []
+    
+    def get_user_total(self, user_id):
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('SELECT total_donated FROM supporters WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            conn.close()
+            return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"❌ Get total error: {e}")
+            return 0
+    
+    def get_stats(self):
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('SELECT SUM(amount) FROM donations WHERE status = "verified"')
+            total_verified = cursor.fetchone()[0] or 0
+            cursor.execute('SELECT SUM(amount) FROM donations WHERE status = "pending"')
+            total_pending = cursor.fetchone()[0] or 0
+            cursor.execute('SELECT COUNT(*) FROM supporters WHERE total_donated > 0')
+            supporters = cursor.fetchone()[0] or 0
+            conn.close()
+            return {
+                "total_verified": total_verified,
+                "total_pending": total_pending,
+                "supporters": supporters
+            }
+        except Exception as e:
+            logger.error(f"❌ Get stats error: {e}")
+            return {"total_verified": 0, "total_pending": 0, "supporters": 0}
 
 donation_db = DonationDB()
 
@@ -784,63 +642,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PAYMENT SELECTION FUNCTION
 # ========================
 async def show_payment_options(update: Update, context: ContextTypes.DEFAULT_TYPE, amount):
-    """Show payment buttons with PayPal automatic option"""
+    """Show payment buttons after amount selection"""
     query = update.callback_query
-    user = query.from_user
     
     # Store the selected amount
-    context.user_data[f"selected_amount_{user.id}"] = amount
+    context.user_data[f"selected_amount_{query.from_user.id}"] = amount
     
     payment_text = f"""
 ✅ *Selected: ${amount}*
 
 Now choose your payment method:
 
-1. **💳 PayPal** - *Automatic verification*
-   • Pay with card or PayPal
-   • Instant confirmation
-   • Most secure option
+*PayPal* - Secure payment with card or PayPal balance
+*Buy Me Coffee* - Simple one-click donation
 
-2. **☕ Buy Me Coffee** - *Manual verification*
-   • Simple one-click donation
-   • Send transaction ID after payment
-
-*Note:* PayPal recommended for instant verification!
+*After payment, click "✅ I've Paid" and send your Transaction ID.*
 """
     
-    # Create PayPal order first
-    order_id, approval_url = create_paypal_order(amount, user.id)
-    
-    if order_id and approval_url:
-        # Save PayPal order to database
-        donation_db.add_paypal_order(order_id, user.id, amount)
-        
-        # Store order ID in user data
-        context.user_data[f"paypal_order_{user.id}"] = order_id
-        
-        # Payment buttons
-        keyboard = [
-            [InlineKeyboardButton("💳 PayPal (Auto-verify)", url=approval_url)],
-            [InlineKeyboardButton("☕ Buy Me Coffee (Manual)", url='https://www.buymeacoffee.com/StarAI')],
-            [InlineKeyboardButton("✅ Check PayPal Payment", callback_data='check_paypal'),
-             InlineKeyboardButton("✅ I've Paid BMC", callback_data='i_donated')],
-            [InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
-        ]
-    else:
-        # If PayPal fails, show manual option only
-        payment_text += f"\n⚠️ *PayPal temporarily unavailable*\nPlease use Buy Me Coffee or try again later."
-        
-        keyboard = [
-            [InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
-            [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
-             InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
-        ]
+    keyboard = [
+        [InlineKeyboardButton("💳 PayPal Payment", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+         InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
+        [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
+         InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
+    ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await query.edit_message_text(payment_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ========================
-# BUTTON HANDLERS (UPDATED WITH PAYMENT BUTTONS)
+# BUTTON HANDLERS
 # ========================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -848,7 +679,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Button pressed: {query.data}")
     
-    # Image and Music buttons
     if query.data == 'create_image':
         await query.edit_message_text(
             "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
@@ -868,174 +698,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'get_quote':
         quote = random.choice(QUOTES)
         await query.edit_message_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
-    
-    # Donation amount selection buttons
-    elif query.data.startswith('donate_'):
-        if query.data == 'donate_custom':
-            context.user_data[f"waiting_custom_{query.from_user.id}"] = True
-            await query.edit_message_text(
-                "💰 *CUSTOM DONATION AMOUNT*\n\n"
-                "Please enter the amount you want to donate (in USD):\n\n"
-                "*Examples:*\n"
-                "• `7.50` (for $7.50)\n"
-                "• `15` (for $15)\n"
-                "• `25` (for $25)\n\n"
-                "Enter amount:",
-                parse_mode="Markdown"
-            )
-        else:
-            # Extract amount from button (donate_3, donate_5, etc.)
-            amount = int(query.data.split('_')[1])
-            await show_payment_options(update, context, amount)
-    
-    # Donation menu button
     elif query.data == 'donate':
         await donate_command(update, context)
-    
-    # NEW: Check PayPal payment button
-    elif query.data == 'check_paypal':
-        user = query.from_user
-        order_id = context.user_data.get(f"paypal_order_{user.id}")
-        
-        if not order_id:
-            await query.edit_message_text(
-                "❌ *No PayPal order found.*\n\n"
-                "Please start a new donation or use Buy Me Coffee.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 New Donation", callback_data='donate')]
-                ])
-            )
-            return
-        
-        # Check PayPal order status
-        await query.edit_message_text(
-            "🔍 *Checking PayPal payment...*\n\nPlease wait...",
-            parse_mode="Markdown"
-        )
-        
-        success, result = capture_paypal_order(order_id)
-        
-        if success:
-            # Payment captured successfully
-            transaction_id = result.get('transaction_id')
-            amount = result.get('amount', 0)
-            
-            # Save to database
-            donation_db.update_paypal_order(order_id, 'captured')
-            
-            # Record donation with automatic verification
-            donation_db.add_donation(
-                user_id=user.id,
-                username=user.username or "No username",
-                first_name=user.first_name,
-                amount=amount,
-                transaction_id=transaction_id,
-                payment_method="paypal"
-            )
-            
-            # Auto-verify PayPal payments
-            donation_db.verify_donation(transaction_id)
-            
-            response = f"""
-✅ *PAYPAL PAYMENT CONFIRMED!*
-
-*Amount:* ${amount:.2f}
-*Transaction ID:* `{transaction_id}`
-*Payment Method:* PayPal
-*Status:* ✅ **Automatically Verified**
-
-*Thank you for supporting StarAI!* 💝
-
-You now have supporter status! 🎖️
-"""
-            
-            # Clear stored data
-            context.user_data.pop(f"selected_amount_{user.id}", None)
-            context.user_data.pop(f"paypal_order_{user.id}", None)
-            
-        else:
-            # Payment not completed yet
-            response = f"""
-⏳ *PAYPAL PAYMENT PENDING*
-
-Your PayPal order is still being processed.
-
-*Order ID:* `{order_id}`
-
-*What to do:*
-1. Complete payment on PayPal page
-2. Return here and click "Check PayPal Payment" again
-3. Or wait a few minutes and try again
-
-*If payment is complete on PayPal but not verifying here, contact admin.*
-"""
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Check Again", callback_data='check_paypal'),
-             InlineKeyboardButton("🏠 Back to Menu", callback_data='back_to_menu')]
-        ]
-        
-        await query.edit_message_text(
-            response,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    # Payment confirmation button (for BMC)
-    elif query.data == 'i_donated':
-        user = query.from_user
-        
-        # Check if amount is selected
-        selected_amount = context.user_data.get(f"selected_amount_{user.id}", 0)
-        
-        if selected_amount == 0:
-            # No amount selected, ask to choose first
-            await query.edit_message_text(
-                "❌ *No Amount Selected*\n\n"
-                "Please select a donation amount first!\n\n"
-                "Click 🔙 Back to choose an amount.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
-                ])
-            )
-            return
-        
-        context.user_data[f"waiting_proof_{user.id}"] = True
-        
-        await query.edit_message_text(
-            f"✅ *PAYMENT CONFIRMATION (Buy Me Coffee)*\n\n"
-            f"*Selected Amount:* ${selected_amount:.2f}\n\n"
-            "Please send your **Transaction ID** or **Payment Reference**:\n\n"
-            "*Format:* `BMC-ABC123` or copy from Buy Me Coffee email\n\n"
-            "*How to find:*\n"
-            "• Check your Buy Me Coffee supporter list\n"
-            "• Look in your confirmation email\n"
-            "• Or send a screenshot of your payment\n\n"
-            "*Note:* Manual verification may take some time.\n"
-            "Thank you! 🙏",
-            parse_mode="Markdown"
-        )
-    
-    # My Donations button
     elif query.data == 'my_donations':
         await mydonations_command(update, context)
-    
-    # Back to menu button
     elif query.data == 'back_to_menu':
         await start(update, context)
-    
-    # Chat button
     elif query.data == 'chat':
         await query.edit_message_text(
-            "💬 *Let's Chat!*\n\n"
-            "I'm here to talk about anything! 😊\n\n"
-            "*Just type your message and I'll respond naturally!* 🎭",
+            "💬 *Let's Chat!*\n\nI'm here to talk about anything! 😊\n\n*Just type your message and I'll respond naturally!* 🎭",
             parse_mode="Markdown"
         )
-    
-    # Help button
     elif query.data == 'help':
         await query.edit_message_text(
             "🆘 *STARAI HELP CENTER*\n\n"
@@ -1056,7 +729,53 @@ Your PayPal order is still being processed.
             "*Just talk to me naturally!* 😊",
             parse_mode="Markdown"
         )
-    
+    elif query.data.startswith('donate_'):
+        if query.data == 'donate_custom':
+            context.user_data[f"waiting_custom_{query.from_user.id}"] = True
+            await query.edit_message_text(
+                "💰 *CUSTOM DONATION AMOUNT*\n\n"
+                "Please enter the amount you want to donate (in USD):\n\n"
+                "*Examples:*\n"
+                "• `7.50` (for $7.50)\n"
+                "• `15` (for $15)\n"
+                "• `25` (for $25)\n\n"
+                "Enter amount:",
+                parse_mode="Markdown"
+            )
+        else:
+            amount = int(query.data.split('_')[1])
+            await show_payment_options(update, context, amount)
+    elif query.data == 'i_donated':
+        user = query.from_user
+        selected_amount = context.user_data.get(f"selected_amount_{user.id}", 0)
+        
+        if selected_amount == 0:
+            await query.edit_message_text(
+                "❌ *No Amount Selected*\n\n"
+                "Please select a donation amount first!\n\n"
+                "Click 🔙 Back to choose an amount.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
+                ])
+            )
+            return
+        
+        context.user_data[f"waiting_proof_{user.id}"] = True
+        
+        await query.edit_message_text(
+            f"✅ *PAYMENT CONFIRMATION*\n\n"
+            f"*Selected Amount:* ${selected_amount:.2f}\n\n"
+            "Please send your **Transaction ID** or **Payment Reference**:\n\n"
+            "*Format:* `TXID123456789` or `BMC-ABC123`\n\n"
+            "*How to find:*\n"
+            "• PayPal: Check email or transaction details\n"
+            "• Buy Me Coffee: Check supporter list\n\n"
+            "Or send a screenshot of your payment confirmation.\n\n"
+            "*Note:* Verification may take some time.\n"
+            "Thank you! 🙏",
+            parse_mode="Markdown"
+        )
     else:
         await query.edit_message_text(
             "🤔 *Not sure what you clicked!*\n\n"
@@ -1089,7 +808,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Minimum donation is $1. Please enter a valid amount.")
                     return
                 
-                # Show payment options for custom amount
                 await show_payment_options(update, context, amount)
                 return
                 
@@ -1097,17 +815,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Invalid amount. Please enter a number (like 5 or 10.50).")
                 return
         
-        # Check for Buy Me Coffee payment proof (MANUAL VERIFICATION)
+        # Check for payment proof
         if context.user_data.get(f"waiting_proof_{user.id}"):
             context.user_data.pop(f"waiting_proof_{user.id}", None)
             
             transaction_id = user_message.strip()
-            
-            # Get selected amount
             amount = context.user_data.get(f"selected_amount_{user.id}", 0)
             
             if amount == 0:
-                # Ask for amount
                 context.user_data[f"waiting_amount_{user.id}"] = transaction_id
                 await update.message.reply_text(
                     "💰 *DONATION AMOUNT*\n\n"
@@ -1121,14 +836,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Save donation (MANUAL - NOT AUTO-VERIFIED)
-            success, message = donation_db.add_donation(
+            success = donation_db.add_donation(
                 user_id=user.id,
                 username=user.username or "No username",
                 first_name=user.first_name,
                 amount=amount,
-                transaction_id=transaction_id,
-                payment_method="buymeacoffee"  # Mark as BMC
+                transaction_id=transaction_id
             )
             
             if success:
@@ -1136,25 +849,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ *DONATION RECORDED!*
 
 *Amount:* ${amount:.2f}
-*Transaction ID:* `{transaction_id}`
-*Payment Method:* Buy Me Coffee
+*Transaction ID:* {transaction_id}
 *Date:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
-*Status:* ⏳ **Pending Manual Verification**
+*Status:* ⏳ **Pending Verification**
 
 *What's next:*
 1. Your donation is now recorded
-2. Admin will verify it manually
+2. It will be verified manually
 3. You'll get supporter status once verified
+
+*Your new total:* ${donation_db.get_user_total(user.id):.2f}
 
 *Thank you for supporting StarAI!* 💝
 
 Use `/mydonations` to check your status.
 """
-                # Clear selected amount
                 context.user_data.pop(f"selected_amount_{user.id}", None)
             else:
-                response = f"❌ {message}"
+                response = "❌ Error recording donation. Please try again."
             
             await update.message.reply_text(response, parse_mode="Markdown")
             return
@@ -1165,13 +878,12 @@ Use `/mydonations` to check your status.
             
             try:
                 amount = float(user_message)
-                success, message = donation_db.add_donation(
+                success = donation_db.add_donation(
                     user_id=user.id,
                     username=user.username or "No username",
                     first_name=user.first_name,
                     amount=amount,
-                    transaction_id=transaction_id,
-                    payment_method="buymeacoffee"
+                    transaction_id=transaction_id
                 )
                 
                 if success:
@@ -1179,16 +891,17 @@ Use `/mydonations` to check your status.
 ✅ *DONATION RECORDED!*
 
 *Amount:* ${amount:.2f}
-*Transaction ID:* `{transaction_id}`
-*Payment Method:* Buy Me Coffee
+*Transaction ID:* {transaction_id}
 *Date:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
-*Status:* ⏳ **Pending Manual Verification**
+*Status:* ⏳ **Pending Verification**
+
+*Your new total:* ${donation_db.get_user_total(user.id):.2f}
 
 *Thank you for supporting StarAI!* 💝
 """
                 else:
-                    response = f"❌ {message}"
+                    response = "❌ Error recording donation. Please try again."
                 
             except ValueError:
                 response = "❌ Invalid amount. Please enter a number (like 5 or 10.50)."
@@ -1368,8 +1081,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 `/admin stats` - Donation statistics
 `/admin pending` - Pending donations
-`/admin verify <txid>` - Verify a MANUAL donation
-`/admin paypal` - PayPal order status
+`/admin verify <txid>` - Verify a donation
 `/admin users` - List supporters
 """
         await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -1379,46 +1091,13 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if cmd == "stats":
         stats = donation_db.get_stats()
-        
-        # Get PayPal stats
-        conn = sqlite3.connect(donation_db.db_file)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*), SUM(amount) FROM paypal_orders WHERE status = 'captured'")
-        paypal_result = cursor.fetchone()
-        paypal_count = paypal_result[0] or 0
-        paypal_total = paypal_result[1] or 0
-        conn.close()
-        
         response = f"""
 📊 *ADMIN STATS*
 
 *Total Verified:* ${stats['total_verified']:.2f}
 *Total Pending:* ${stats['total_pending']:.2f}
 *Total Supporters:* {stats['supporters']}
-
-*PayPal Stats:*
-• Successful payments: {paypal_count}
-• PayPal total: ${paypal_total:.2f}
 """
-        await update.message.reply_text(response, parse_mode="Markdown")
-    
-    elif cmd == "paypal":
-        conn = sqlite3.connect(donation_db.db_file)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM paypal_orders ORDER BY created_at DESC LIMIT 10')
-        orders = cursor.fetchall()
-        conn.close()
-        
-        if not orders:
-            await update.message.reply_text("✅ No PayPal orders.", parse_mode="Markdown")
-            return
-        
-        response = "💳 *RECENT PAYPAL ORDERS*\n\n"
-        for order in orders:
-            response += f"• Order: `{order[0]}`\n"
-            response += f"  User: {order[1]}, Amount: ${order[2]}\n"
-            response += f"  Status: {order[3]}, Date: {order[4][:16]}\n\n"
-        
         await update.message.reply_text(response, parse_mode="Markdown")
     
     elif cmd == "pending":
@@ -1437,8 +1116,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += f"{i+1}. User {donation[1]} ({donation[3]})\n"
             response += f"   Amount: ${donation[4]:.2f}\n"
             response += f"   TXID: {donation[6]}\n"
-            response += f"   Method: {donation[7]}\n"
-            response += f"   Date: {donation[8][:16]}\n\n"
+            response += f"   Date: {donation[7][:16]}\n\n"
         
         response += "*To verify:* `/admin verify TXID`"
         await update.message.reply_text(response, parse_mode="Markdown")
@@ -1457,50 +1135,29 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Could not verify donation `{transaction_id}`", parse_mode="Markdown")
 
 # ========================
-# ENVIRONMENT CHECK
-# ========================
-def check_environment():
-    """Check if all required environment variables are set"""
-    print("=" * 50)
-    print("🌟 STARAI - PAYMENT SYSTEM CHECK")
-    print("=" * 50)
-    
-    required = ['TELEGRAM_TOKEN']
-    missing = []
-    
-    for var in required:
-        if not os.environ.get(var):
-            missing.append(var)
-    
-    if missing:
-        print(f"❌ MISSING: {', '.join(missing)}")
-        print("Set in Heroku: Settings → Config Vars")
-        return False
-    
-    print("✅ Telegram Bot: Ready")
-    
-    # Check PayPal
-    if PAYPAL_CLIENT_ID and PAYPAL_SECRET:
-        print("✅ PayPal: Automatic payments ENABLED")
-        print(f"   Environment: {PAYPAL_ENVIRONMENT}")
-        if PAYPAL_WEBHOOK_ID:
-            print("✅ PayPal Webhook: Configured")
-        else:
-            print("⚠️  PayPal Webhook: Not configured (optional)")
-    else:
-        print("⚠️  PayPal: Manual mode only")
-        print("   Set PAYPAL_CLIENT_ID and PAYPAL_SECRET for auto-verify")
-    
-    print("☕ Buy Me Coffee: Manual verification")
-    print("=" * 50)
-    return True
-
-# ========================
 # MAIN FUNCTION
 # ========================
 def main():
-    if not check_environment():
+    print("=" * 50)
+    print("🌟 STARAI - COMPLETE AI ASSISTANT")
+    print("=" * 50)
+    
+    if not TELEGRAM_TOKEN:
+        print("❌ ERROR: TELEGRAM_TOKEN not found!")
+        print("Set in Heroku: Settings → Config Vars → Add TELEGRAM_TOKEN")
         return
+    
+    if not GROQ_API_KEY:
+        print("⚠️ WARNING: GROQ_API_KEY missing - AI chat limited")
+    else:
+        print("✅ Groq AI: Enabled")
+    
+    print("✅ Telegram Bot: Ready")
+    print("🎨 Image generation: Enabled")
+    print("🎵 Music search: Enabled")
+    print("💰 Donation system: WITH PAYMENT BUTTONS")
+    print("🎭 Fun commands: Jokes, Facts, Quotes")
+    print("=" * 50)
     
     try:
         app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1525,10 +1182,8 @@ def main():
         app.add_handler(CallbackQueryHandler(button_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        print("✅ StarAI is running with PayPal Auto-Verify!")
-        print("💰 Users can choose:")
-        print("   • PayPal (Automatic verification)")
-        print("   • Buy Me Coffee (Manual verification)")
+        print("✅ StarAI is running with PAYMENT BUTTONS!")
+        print("💰 Users now click payment links instead of typing URLs")
         print("🔧 Send /start to begin")
         print("=" * 50)
         
