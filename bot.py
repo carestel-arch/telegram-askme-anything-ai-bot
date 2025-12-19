@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes, CallbackQueryHandler
 )
 from groq import Groq
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from youtubesearchpython import VideosSearch
 
 # ========================
@@ -87,40 +87,193 @@ def clear_conversation(user_id):
         del user_conversations[user_id]
 
 # ========================
-# IMAGE GENERATION
+# IMAGE GENERATION FUNCTIONS
 # ========================
-def generate_image(prompt):
-    """Generate images using free APIs"""
+def create_fallback_image(prompt):
+    """Create a fallback image when APIs fail"""
     try:
-        # Method 1: Pollinations.ai (free)
-        poll_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=512&height=512"
-        response = requests.get(poll_url, timeout=15)
-        
-        if response.status_code == 200:
-            # Save to temp file
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                tmp.write(response.content)
-                return tmp.name
-        
-        # Method 2: Placeholder with text
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            # Create simple image
-            img = Image.new('RGB', (400, 400), color=(73, 109, 137))
-            
-            # Add text (simplified)
-            from PIL import ImageDraw, ImageFont
+            # Create image
+            img = Image.new('RGB', (512, 512), color=(40, 44, 52))
             draw = ImageDraw.Draw(img)
             
-            # Simple text
-            text = prompt[:30] if len(prompt) > 30 else prompt
-            draw.text((50, 180), f"StarAI:\n{text}", fill=(255, 255, 255))
+            # Try to load a font
+            try:
+                # Try different font paths
+                font_paths = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "arial.ttf",
+                    "Arial.ttf"
+                ]
+                font = None
+                for font_path in font_paths:
+                    try:
+                        font = ImageFont.truetype(font_path, 24)
+                        break
+                    except:
+                        continue
+                if font is None:
+                    font = ImageFont.load_default()
+            except:
+                font = ImageFont.load_default()
+            
+            # Format text
+            lines = []
+            words = prompt.split()
+            current_line = ""
+            
+            for word in words:
+                test_line = current_line + " " + word if current_line else word
+                if len(test_line) <= 30:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+            if current_line:
+                lines.append(current_line)
+            
+            # Draw text (center it)
+            text = "\n".join(lines[:5])  # Max 5 lines
+            
+            # Get text size
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                # Fallback for older PIL
+                text_width = len(max(text.split('\n'), key=len)) * 10
+                text_height = len(text.split('\n')) * 30
+            
+            x = (512 - text_width) // 2
+            y = (512 - text_height) // 2
+            
+            # Draw text with shadow
+            shadow_offset = 2
+            draw.text((x + shadow_offset, y + shadow_offset), text, 
+                     fill=(30, 30, 30), font=font, align="center")
+            draw.text((x, y), text, fill=(255, 215, 0), font=font, align="center")
+            
+            # Add StarAI watermark
+            draw.text((10, 480), "✨ StarAI", fill=(100, 200, 255), font=font)
             
             img.save(tmp.name, 'PNG')
             return tmp.name
             
     except Exception as e:
-        logger.error(f"Image error: {e}")
+        logger.error(f"Fallback image error: {e}")
         return None
+
+def generate_image(prompt):
+    """Generate images using multiple free APIs"""
+    try:
+        logger.info(f"Generating image for prompt: {prompt}")
+        
+        # Method 1: Pollinations.ai with retry
+        for attempt in range(2):
+            try:
+                poll_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
+                params = {
+                    "width": 512,
+                    "height": 512,
+                    "seed": random.randint(1, 999999),
+                    "nofilter": "true"
+                }
+                
+                response = requests.get(
+                    poll_url, 
+                    params=params,
+                    timeout=15,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (compatible; StarAI/1.0)',
+                        'Accept': 'image/*'
+                    }
+                )
+                
+                if response.status_code == 200 and len(response.content) > 1000:
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        tmp.write(response.content)
+                        logger.info(f"Image generated via Pollinations.ai: {tmp.name}")
+                        return tmp.name
+                else:
+                    logger.warning(f"Pollinations attempt {attempt + 1} failed: {response.status_code}")
+            except Exception as e:
+                logger.warning(f"Pollinations attempt {attempt + 1} error: {e}")
+        
+        # Method 2: Lexica.art API
+        try:
+            lexica_url = "https://lexica.art/api/infinite-prompts"
+            data = {
+                "text": prompt,
+                "searchMode": "images",
+                "source": "search"
+            }
+            response = requests.post(lexica_url, json=data, timeout=20)
+            
+            if response.status_code == 200:
+                results = response.json()
+                if results.get("prompts") and len(results["prompts"]) > 0:
+                    # Get first image
+                    image_id = results["prompts"][0]["id"]
+                    image_url = f"https://image.lexica.art/full_jpg/{image_id}"
+                    
+                    img_response = requests.get(image_url, timeout=20)
+                    if img_response.status_code == 200:
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                            tmp.write(img_response.content)
+                            logger.info(f"Image generated via Lexica: {tmp.name}")
+                            return tmp.name
+        except Exception as e:
+            logger.warning(f"Lexica API error: {e}")
+        
+        # Method 3: Craiyon API (formerly DALL-E mini)
+        try:
+            craiyon_url = "https://api.craiyon.com/v3"
+            response = requests.post(
+                craiyon_url,
+                json={"prompt": prompt},
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("images") and len(data["images"]) > 0:
+                    import base64
+                    # Get first image (base64 encoded)
+                    image_data = data["images"][0]
+                    if image_data.startswith('data:image'):
+                        image_data = image_data.split(',')[1]
+                    
+                    image_bytes = base64.b64decode(image_data)
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        tmp.write(image_bytes)
+                        logger.info(f"Image generated via Craiyon: {tmp.name}")
+                        return tmp.name
+        except Exception as e:
+            logger.warning(f"Craiyon API error: {e}")
+        
+        # Method 4: Unsplash (for simple requests)
+        try:
+            if len(prompt.split()) <= 3:  # Simple prompts only
+                unsplash_url = f"https://source.unsplash.com/512x512/?{requests.utils.quote(prompt)}"
+                response = requests.get(unsplash_url, timeout=15)
+                
+                if response.status_code == 200:
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                        tmp.write(response.content)
+                        logger.info(f"Image from Unsplash: {tmp.name}")
+                        return tmp.name
+        except Exception as e:
+            logger.warning(f"Unsplash error: {e}")
+        
+        # Final fallback: Create custom image
+        logger.info("Using fallback image generation")
+        return create_fallback_image(prompt)
+            
+    except Exception as e:
+        logger.error(f"Image generation error: {e}")
+        return create_fallback_image(prompt)
 
 # ========================
 # MUSIC SEARCH
@@ -133,14 +286,16 @@ def search_music(query):
         
         music_list = []
         for i, video in enumerate(results[:3], 1):
-            title = video['title'][:50]
+            title = video['title'][:50] + "..." if len(video['title']) > 50 else video['title']
             url = video['link']
             duration = video.get('duration', 'N/A')
-            music_list.append(f"{i}. 🎵 {title}\n   ⏱️ {duration}\n   🔗 {url}")
+            views = video.get('viewCount', {}).get('short', 'N/A')
+            music_list.append(f"{i}. 🎵 {title}\n   ⏱️ {duration} | 👁️ {views}\n   🔗 {url}")
         
         return music_list
-    except:
-        return ["Use: /music <song or artist>"]
+    except Exception as e:
+        logger.error(f"Music search error: {e}")
+        return ["🎵 Use: `/music <song or artist>`", "Example: `/music Bohemian Rhapsody`"]
 
 # ========================
 # FUN CONTENT
@@ -151,6 +306,7 @@ JOKES = [
     "🤣 What do you call a fake noodle? An impasta!",
     "😆 Why did the math book look so sad? Because it had too many problems!",
     "😊 How does the moon cut his hair? Eclipse it!",
+    "😁 Why did the computer go to the doctor? It had a virus!",
 ]
 
 FACTS = [
@@ -159,6 +315,7 @@ FACTS = [
     "🌊 The shortest war was Britain-Zanzibar in 1896. It lasted 38 minutes!",
     "🐌 Snails can sleep for up to three years when hibernating.",
     "🦒 A giraffe's neck has the same number of vertebrae as humans: seven!",
+    "🐧 Penguins propose to their mates with pebbles!",
 ]
 
 QUOTES = [
@@ -167,6 +324,7 @@ QUOTES = [
     "🚀 'The future belongs to those who believe in the beauty of their dreams.' - Eleanor Roosevelt",
     "🌱 'The only impossible journey is the one you never begin.' - Tony Robbins",
     "💖 'Be yourself; everyone else is already taken.' - Oscar Wilde",
+    "✨ 'Success is not final, failure is not fatal: it is the courage to continue that counts.' - Winston Churchill",
 ]
 
 # ========================
@@ -204,13 +362,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Entertainment
 
 🔧 **COMMANDS:**
-/image <text> - Generate images
-/music <song> - Find music
-/joke - Get a joke
-/fact - Learn a fact
-/quote - Inspiration
-/clear - Reset chat
-/help - All commands
+`/image <text>` - Generate images
+`/music <song>` - Find music
+`/joke` - Get a joke
+`/fact` - Learn a fact
+`/quote` - Inspiration
+`/clear` - Reset chat
+`/help` - All commands
 
 *Tap buttons below or type commands!* 🚀
     """
@@ -237,20 +395,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🆘 *STARAI HELP CENTER*
 
 🎨 **MEDIA COMMANDS:**
-/image <description> - Generate AI image
-/music <song/artist> - Find music links
-/meme - Get fun images
+`/image <description>` - Generate AI image
+`/music <song/artist>` - Find music links
+`/meme` - Get fun images
 
 💬 **CHAT COMMANDS:**
-/start - Welcome message
-/help - This help
-/clear - Reset conversation
-/about - About StarAI
+`/start` - Welcome message
+`/help` - This help
+`/clear` - Reset conversation
+`/about` - About StarAI
 
 🎭 **FUN COMMANDS:**
-/joke - Get a joke
-/fact - Learn a fact  
-/quote - Inspiring quote
+`/joke` - Get a joke
+`/fact` - Learn a fact  
+`/quote` - Inspiring quote
 
 🤖 **NATURAL LANGUAGE:**
 You can also say:
@@ -303,33 +461,54 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not prompt:
         await update.message.reply_text(
-            "🎨 *Usage:* /image <description>\n\n"
-            "Examples:\n• /image sunset over mountains\n• /image cute cat in space\n• /image futuristic city",
+            "🎨 *Usage:* `/image <description>`\n\n"
+            "*Examples:*\n• `/image sunset over mountains`\n• `/image cute cat in space`\n• `/image futuristic city`\n\n"
+            "*Tip:* Be descriptive for better results!",
             parse_mode="Markdown"
         )
         return
     
-    await update.message.reply_text(f"🎨 *Creating:* {prompt}\n\nPlease wait...", parse_mode="Markdown")
+    # Send initial message
+    msg = await update.message.reply_text(
+        f"✨ *Creating Image:*\n`{prompt}`\n\n⏳ Please wait... This may take 10-20 seconds.",
+        parse_mode="Markdown"
+    )
     
+    # Generate image
     image_path = generate_image(prompt)
     
-    if image_path:
+    if image_path and os.path.exists(image_path):
         try:
+            # Send the image
             with open(image_path, 'rb') as photo:
                 await update.message.reply_photo(
                     photo=photo,
-                    caption=f"✨ *Generated:* {prompt}\n*Created by StarAI* 🎨",
+                    caption=f"🎨 *Generated:* `{prompt}`\n\n✨ Created by StarAI",
                     parse_mode="Markdown"
                 )
+            
+            # Delete the waiting message
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Send image error: {e}")
+            await msg.edit_text(
+                "❌ *Error sending image.*\n\nThe image was created but couldn't be sent. Try again!",
+                parse_mode="Markdown"
+            )
         finally:
             # Clean up temp file
             try:
-                os.unlink(image_path)
-            except:
-                pass
+                if os.path.exists(image_path):
+                    os.unlink(image_path)
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
     else:
-        await update.message.reply_text(
-            "❌ *Image creation failed.*\n\nTry:\n• Simpler description\n• Different keywords\n• Or try again later",
+        await msg.edit_text(
+            "❌ *Image creation failed.*\n\nTry:\n• A simpler description\n• Different keywords\n• Wait a moment and try again\n\nExample: `/image simple landscape`",
             parse_mode="Markdown"
         )
 
@@ -339,38 +518,40 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not query:
         await update.message.reply_text(
-            "🎵 *Usage:* /music <song or artist>\n\n"
-            "Examples:\n• /music Bohemian Rhapsody\n• /music Taylor Swift\n• /music classical music",
+            "🎵 *Usage:* `/music <song or artist>`\n\n"
+            "*Examples:*\n• `/music Bohemian Rhapsody`\n• `/music Taylor Swift`\n• `/music classical music`",
             parse_mode="Markdown"
         )
         return
     
-    await update.message.reply_text(f"🔍 *Searching:* {query}", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 *Searching:* `{query}`", parse_mode="Markdown")
     
     results = search_music(query)
     
-    response = "🎶 *Music Results:*\n\n"
-    for result in results:
-        response += f"{result}\n\n"
-    
-    response += "💡 *Note:* These are YouTube links for legal listening."
+    if len(results) > 0 and "Use:" not in results[0]:
+        response = "🎶 *Music Results:*\n\n"
+        for result in results:
+            response += f"{result}\n\n"
+        response += "💡 *Note:* These are YouTube links for listening."
+    else:
+        response = "❌ *No results found.*\n\nTry:\n• Different search terms\n• Check spelling\n• Example: `/music Shape of You`"
     
     await update.message.reply_text(response, parse_mode="Markdown")
 
 async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tell a joke"""
     joke = random.choice(JOKES)
-    await update.message.reply_text(f"😂 *Joke:*\n\n{joke}", parse_mode="Markdown")
+    await update.message.reply_text(f"😂 *Joke of the Day:*\n\n{joke}", parse_mode="Markdown")
 
 async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Share a fun fact"""
     fact = random.choice(FACTS)
-    await update.message.reply_text(f"💡 *Did you know?*\n\n{fact}", parse_mode="Markdown")
+    await update.message.reply_text(f"💡 *Did You Know?*\n\n{fact}", parse_mode="Markdown")
 
 async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Share inspirational quote"""
     quote = random.choice(QUOTES)
-    await update.message.reply_text(f"📜 *Quote:*\n\n{quote}", parse_mode="Markdown")
+    await update.message.reply_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear conversation memory"""
@@ -384,8 +565,10 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get a fun image"""
     try:
-        # Get random image from Unsplash
-        response = requests.get("https://source.unsplash.com/random/400x400/?funny,meme,comedy", timeout=10)
+        # Get random meme image
+        meme_topics = ["funny", "meme", "comedy", "cat", "dog", "dank", "wholesome"]
+        topic = random.choice(meme_topics)
+        response = requests.get(f"https://source.unsplash.com/400x400/?{topic}", timeout=10)
         
         if response.status_code == 200:
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
@@ -395,7 +578,7 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(tmp_path, 'rb') as photo:
                 await update.message.reply_photo(
                     photo=photo,
-                    caption="😄 *Fun Image!*\nUse /image to create your own!",
+                    caption=f"😄 *Random {topic.capitalize()} Image!*\nUse `/image` to create your own!",
                     parse_mode="Markdown"
                 )
             
@@ -407,9 +590,10 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await joke_command(update, context)
             
-    except:
+    except Exception as e:
+        logger.error(f"Meme error: {e}")
         await update.message.reply_text(
-            "🎭 Need fun? Try:\n• /joke - For laughs\n• /image - Create memes\n• Just chat with me! 😊",
+            "🎭 Need fun? Try:\n• `/joke` - For laughs\n• `/image` - Create your own memes\n• Just chat with me! 😊",
             parse_mode="Markdown"
         )
 
@@ -423,12 +607,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == 'create_image':
         await query.edit_message_text(
-            "🎨 *Image Creation*\n\nSend: /image <description>\n\nExamples:\n• /image dragon in forest\n• /image cyberpunk city\n• /image cute puppy",
+            "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
             parse_mode="Markdown"
         )
     elif query.data == 'find_music':
         await query.edit_message_text(
-            "🎵 *Music Search*\n\nSend: /music <song or artist>\n\nExamples:\n• /music Imagine Dragons\n• /music chill lofi\n• /music 80s hits",
+            "🎵 *Music Search*\n\nSend: `/music <song or artist>`\n\n*Examples:*\n• `/music Imagine Dragons`\n• `/music chill lofi`\n• `/music 80s hits`",
             parse_mode="Markdown"
         )
     elif query.data == 'get_joke':
@@ -438,7 +622,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'get_quote':
         await query.edit_message_text(f"📜 *Quote:*\n\n{random.choice(QUOTES)}", parse_mode="Markdown")
     elif query.data == 'help':
-        await help_command(update, context)
+        await query.edit_message_text(
+            "🆘 *Need Help?*\n\n"
+            "✨ *Main Commands:*\n"
+            "• `/image` - Create AI images\n"
+            "• `/music` - Find songs\n"
+            "• `/joke` - Get jokes\n"
+            "• `/fact` - Learn facts\n"
+            "• `/quote` - Inspiration\n"
+            "• `/clear` - Reset chat\n\n"
+            "💬 *Just talk naturally to me!*",
+            parse_mode="Markdown"
+        )
 
 # ========================
 # AI RESPONSE GENERATOR
@@ -447,7 +642,7 @@ def generate_ai_response(user_id, user_message):
     """Generate intelligent AI response"""
     try:
         if not client:
-            return "🤖 *AI Service:* Currently unavailable. Try commands like /image or /music!"
+            return "🤖 *AI Service:* Currently unavailable. Try commands like `/image` or `/music`!"
         
         conversation = get_user_conversation(user_id)
         conversation.append({"role": "user", "content": user_message})
@@ -510,7 +705,7 @@ It's one of the most beautiful human experiences!"""
 💬 *Chat naturally:* "Explain quantum physics"
 🎭 *Have fun:* "Tell me a joke"
 
-Or use commands: /image, /music, /joke, /help 😊"""
+Or use commands: `/image`, `/music`, `/joke`, `/help` 😊"""
 
 # ========================
 # MAIN MESSAGE HANDLER
@@ -529,68 +724,90 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action="typing"
         )
         
-        # Check for image requests
-        image_words = ["create image", "generate image", "draw", "paint", "picture of", "image of"]
-        if any(word in user_message.lower() for word in image_words):
+        # Check for image requests in natural language
+        image_keywords = ["create image", "generate image", "draw", "paint", "picture of", "image of", "make a picture", "generate a picture"]
+        if any(keyword in user_message.lower() for keyword in image_keywords):
             prompt = user_message
-            for word in image_words:
-                if word in user_message.lower():
-                    prompt = user_message.lower().split(word)[-1].strip()
-                    break
             
-            if not prompt or len(prompt) < 3:
+            # Extract prompt from request
+            for keyword in image_keywords:
+                if keyword in user_message.lower():
+                    parts = user_message.lower().split(keyword)
+                    if len(parts) > 1:
+                        prompt = parts[1].strip()
+                        break
+            
+            if not prompt or len(prompt) < 2:
                 prompt = "a beautiful artwork"
             
-            await update.message.reply_text(f"🎨 Creating: {prompt}...")
+            msg = await update.message.reply_text(f"🎨 *Creating:* `{prompt}`...", parse_mode="Markdown")
             image_path = generate_image(prompt)
             
-            if image_path:
-                with open(image_path, 'rb') as photo:
-                    await update.message.reply_photo(
-                        photo=photo,
-                        caption=f"✨ *Created:* {prompt}\n*By StarAI* 🎨",
-                        parse_mode="Markdown"
-                    )
+            if image_path and os.path.exists(image_path):
                 try:
-                    os.unlink(image_path)
-                except:
-                    pass
+                    with open(image_path, 'rb') as photo:
+                        await update.message.reply_photo(
+                            photo=photo,
+                            caption=f"✨ *Generated:* `{prompt}`\n*By StarAI* 🎨",
+                            parse_mode="Markdown"
+                        )
+                    
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=msg.message_id
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending image: {e}")
+                    await msg.edit_text("❌ Couldn't send the image. Try `/image` command instead.")
+                finally:
+                    try:
+                        if os.path.exists(image_path):
+                            os.unlink(image_path)
+                    except:
+                        pass
             else:
-                await update.message.reply_text("Try: /image <description>")
+                await msg.edit_text("❌ Image creation failed. Try: `/image <description>`")
             return
         
-        # Check for music requests
-        music_words = ["play music", "find song", "music by", "listen to", "song by"]
-        if any(word in user_message.lower() for word in music_words):
+        # Check for music requests in natural language
+        music_keywords = ["play music", "find song", "music by", "listen to", "song by", "find music", "search music"]
+        if any(keyword in user_message.lower() for keyword in music_keywords):
             query = user_message
-            for word in music_words:
-                if word in user_message.lower():
-                    query = user_message.lower().split(word)[-1].strip()
-                    break
+            
+            for keyword in music_keywords:
+                if keyword in user_message.lower():
+                    parts = user_message.lower().split(keyword)
+                    if len(parts) > 1:
+                        query = parts[1].strip()
+                        break
             
             if not query:
                 query = "popular music"
             
-            await update.message.reply_text(f"🎵 Searching: {query}...")
+            msg = await update.message.reply_text(f"🎵 *Searching:* `{query}`...", parse_mode="Markdown")
             results = search_music(query)
             
-            response = "🎶 *Results:*\n\n"
-            for result in results:
-                response += f"{result}\n\n"
+            if len(results) > 0 and "Use:" not in results[0]:
+                response = "🎶 *Music Results:*\n\n"
+                for result in results:
+                    response += f"{result}\n\n"
+                response += "💡 *Note:* YouTube links for listening."
+            else:
+                response = "❌ *No results found.* Try: `/music <song name>`"
             
-            await update.message.reply_text(response, parse_mode="Markdown")
+            await msg.edit_text(response, parse_mode="Markdown")
             return
         
-        # Generate AI response
+        # Generate AI response for other messages
         ai_response = generate_ai_response(user.id, user_message)
         
         # Send response
         await update.message.reply_text(ai_response, parse_mode="Markdown")
         
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error in handle_message: {e}")
         await update.message.reply_text(
-            "❌ *Error occurred.*\n\nTry:\n• /help for commands\n• Rephrase your message\n• I'm still learning! 😊",
+            "❌ *Error occurred.*\n\nTry:\n• `/help` for commands\n• Rephrase your message\n• I'm still learning! 😊",
             parse_mode="Markdown"
         )
 
@@ -607,6 +824,7 @@ def main():
     if not TELEGRAM_TOKEN:
         print("❌ ERROR: TELEGRAM_TOKEN missing!")
         print("Add to Heroku: Settings → Config Vars")
+        print("Or set: export TELEGRAM_TOKEN='your_token'")
         return
     
     if not GROQ_API_KEY:
@@ -617,38 +835,43 @@ def main():
     print("✅ Starting StarAI with all features...")
     
     # Create application
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Add command handlers
-    commands = [
-        ("start", start),
-        ("help", help_command),
-        ("about", about_command),
-        ("image", image_command),
-        ("music", music_command),
-        ("joke", joke_command),
-        ("fact", fact_command),
-        ("quote", quote_command),
-        ("clear", clear_command),
-        ("meme", meme_command),
-    ]
-    
-    for command, handler in commands:
-        app.add_handler(CommandHandler(command, handler))
-    
-    # Add button handler
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handler
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("✅ StarAI v2.0 is running!")
-    print("📱 Features: AI Chat, Image Generation, Music Search, Fun Commands")
-    print("🔧 Send /start to begin")
-    print("=" * 50)
-    
-    # Start bot
-    app.run_polling()
+    try:
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        # Add command handlers
+        commands = [
+            ("start", start),
+            ("help", help_command),
+            ("about", about_command),
+            ("image", image_command),
+            ("music", music_command),
+            ("joke", joke_command),
+            ("fact", fact_command),
+            ("quote", quote_command),
+            ("clear", clear_command),
+            ("meme", meme_command),
+        ]
+        
+        for command, handler in commands:
+            app.add_handler(CommandHandler(command, handler))
+        
+        # Add button handler
+        app.add_handler(CallbackQueryHandler(button_callback))
+        
+        # Add message handler
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        print("✅ StarAI v2.0 is running!")
+        print("📱 Features: AI Chat, Image Generation, Music Search, Fun Commands")
+        print("🔧 Send /start to begin")
+        print("=" * 50)
+        
+        # Start bot
+        app.run_polling()
+        
+    except Exception as e:
+        print(f"❌ Failed to start: {e}")
+        print("Check your TELEGRAM_TOKEN")
 
 if __name__ == '__main__':
     main()
