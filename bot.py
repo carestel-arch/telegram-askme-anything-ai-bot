@@ -5,6 +5,7 @@ import requests
 import logging
 import random
 import tempfile
+import base64
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -90,14 +91,14 @@ def clear_conversation(user_id):
 # IMAGE GENERATION FUNCTIONS
 # ========================
 def create_fallback_image(prompt):
-    """Create a fallback image when APIs fail"""
+    """Create a fallback image with text"""
     try:
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
             # Create image
             img = Image.new('RGB', (512, 512), color=(40, 44, 52))
             draw = ImageDraw.Draw(img)
             
-            # Try to load a font
+            # Load font
             try:
                 # Try different font paths
                 font_paths = [
@@ -108,7 +109,7 @@ def create_fallback_image(prompt):
                 font = None
                 for font_path in font_paths:
                     try:
-                        font = ImageFont.truetype(font_path, 24)
+                        font = ImageFont.truetype(font_path, 32)
                         break
                     except:
                         continue
@@ -123,9 +124,8 @@ def create_fallback_image(prompt):
             current_line = ""
             
             for word in words:
-                test_line = current_line + " " + word if current_line else word
-                if len(test_line) <= 30:
-                    current_line = test_line
+                if len(current_line + " " + word) <= 20:
+                    current_line = current_line + " " + word if current_line else word
                 else:
                     if current_line:
                         lines.append(current_line)
@@ -133,32 +133,40 @@ def create_fallback_image(prompt):
             if current_line:
                 lines.append(current_line)
             
-            # Draw text (center it)
-            text = "\n".join(lines[:5])  # Max 5 lines
+            # Draw main text
+            text = "\n".join(lines[:4])  # Max 4 lines
+            if len(lines) > 4:
+                text += "\n..."
             
-            # Get text size
+            # Calculate text position
             if hasattr(draw, 'textbbox'):
                 bbox = draw.textbbox((0, 0), text, font=font)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
             else:
-                # Fallback for older PIL
-                text_width = len(max(text.split('\n'), key=len)) * 10
-                text_height = len(text.split('\n')) * 30
+                text_width = len(max(text.split('\n'), key=len)) * 20
+                text_height = len(text.split('\n')) * 40
             
             x = (512 - text_width) // 2
             y = (512 - text_height) // 2
             
-            # Draw text with shadow
-            shadow_offset = 2
-            draw.text((x + shadow_offset, y + shadow_offset), text, 
-                     fill=(30, 30, 30), font=font, align="center")
+            # Draw background for text
+            padding = 20
+            draw.rectangle([x-padding, y-padding, x+text_width+padding, y+text_height+padding], 
+                         fill=(30, 34, 42))
+            
+            # Draw text
             draw.text((x, y), text, fill=(255, 215, 0), font=font, align="center")
             
-            # Add StarAI watermark
-            draw.text((10, 480), "✨ StarAI", fill=(100, 200, 255), font=font)
+            # Add watermark
+            draw.text((10, 480), "✨ StarAI Image", fill=(100, 200, 255), font=font)
+            
+            # Add prompt
+            draw.text((10, 10), f"Prompt: {prompt[:30]}...", fill=(200, 200, 200), 
+                     font=ImageFont.load_default())
             
             img.save(tmp.name, 'PNG')
+            logger.info(f"Created fallback image: {tmp.name}")
             return tmp.name
             
     except Exception as e:
@@ -166,70 +174,71 @@ def create_fallback_image(prompt):
         return None
 
 def generate_image(prompt):
-    """Generate images using multiple free APIs"""
+    """Generate images using Pollinations.ai"""
     try:
-        logger.info(f"Generating image for prompt: {prompt}")
+        logger.info(f"Generating image for: {prompt}")
         
-        # Method 1: Pollinations.ai with retry
-        for attempt in range(2):
-            try:
-                poll_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
-                params = {
-                    "width": 512,
-                    "height": 512,
-                    "seed": random.randint(1, 999999),
-                    "nofilter": "true"
-                }
-                
-                response = requests.get(
-                    poll_url, 
-                    params=params,
-                    timeout=15,
-                    headers={
-                        'User-Agent': 'Mozilla/5.0 (compatible; StarAI/1.0)',
-                        'Accept': 'image/*'
-                    }
-                )
-                
-                if response.status_code == 200 and len(response.content) > 1000:
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        tmp.write(response.content)
-                        logger.info(f"Image generated via Pollinations.ai: {tmp.name}")
-                        return tmp.name
-                else:
-                    logger.warning(f"Pollinations attempt {attempt + 1} failed: {response.status_code}")
-            except Exception as e:
-                logger.warning(f"Pollinations attempt {attempt + 1} error: {e}")
-        
-        # Method 2: Lexica.art API
+        # Method 1: Pollinations.ai (primary method)
         try:
-            lexica_url = "https://lexica.art/api/infinite-prompts"
-            data = {
-                "text": prompt,
-                "searchMode": "images",
-                "source": "search"
+            # Format the prompt
+            clean_prompt = prompt.strip().replace(" ", "%20")
+            
+            # Create pollinations URL
+            poll_url = f"https://image.pollinations.ai/prompt/{clean_prompt}"
+            
+            # Add parameters
+            params = {
+                "width": "512",
+                "height": "512",
+                "seed": str(random.randint(1, 1000000)),
+                "nofilter": "true"
             }
-            response = requests.post(lexica_url, json=data, timeout=20)
+            
+            logger.info(f"Calling Pollinations.ai with URL: {poll_url}")
+            
+            # Make request
+            response = requests.get(
+                poll_url,
+                params=params,
+                timeout=30,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'image/*'
+                }
+            )
             
             if response.status_code == 200:
-                results = response.json()
-                if results.get("prompts") and len(results["prompts"]) > 0:
-                    # Get first image
-                    image_id = results["prompts"][0]["id"]
-                    image_url = f"https://image.lexica.art/full_jpg/{image_id}"
-                    
-                    img_response = requests.get(image_url, timeout=20)
-                    if img_response.status_code == 200:
-                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                            tmp.write(img_response.content)
-                            logger.info(f"Image generated via Lexica: {tmp.name}")
-                            return tmp.name
+                # Check if response is actually an image
+                content_type = response.headers.get('content-type', '')
+                if 'image' in content_type or len(response.content) > 1000:
+                    # Save to temp file
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        tmp.write(response.content)
+                        tmp_path = tmp.name
+                        logger.info(f"Successfully generated image: {tmp_path}, size: {len(response.content)} bytes")
+                        
+                        # Verify it's a valid image
+                        try:
+                            img = Image.open(tmp_path)
+                            img.verify()  # Verify it's a valid image
+                            img.close()
+                            return tmp_path
+                        except Exception as e:
+                            logger.warning(f"Generated image is invalid: {e}")
+                            os.unlink(tmp_path)
+                else:
+                    logger.warning(f"Pollinations returned non-image: {content_type}")
+            else:
+                logger.warning(f"Pollinations request failed: {response.status_code}")
+                
         except Exception as e:
-            logger.warning(f"Lexica API error: {e}")
+            logger.error(f"Pollinations.ai error: {e}")
         
-        # Method 3: Craiyon API (formerly DALL-E mini)
+        # Method 2: Craiyon API (backup)
         try:
+            logger.info("Trying Craiyon API...")
             craiyon_url = "https://api.craiyon.com/v3"
+            
             response = requests.post(
                 craiyon_url,
                 json={"prompt": prompt},
@@ -239,7 +248,6 @@ def generate_image(prompt):
             if response.status_code == 200:
                 data = response.json()
                 if data.get("images") and len(data["images"]) > 0:
-                    import base64
                     # Get first image (base64 encoded)
                     image_data = data["images"][0]
                     if image_data.startswith('data:image'):
@@ -248,26 +256,38 @@ def generate_image(prompt):
                     image_bytes = base64.b64decode(image_data)
                     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                         tmp.write(image_bytes)
-                        logger.info(f"Image generated via Craiyon: {tmp.name}")
+                        logger.info(f"Generated image via Craiyon: {tmp.name}")
                         return tmp.name
+                        
         except Exception as e:
-            logger.warning(f"Craiyon API error: {e}")
+            logger.error(f"Craiyon API error: {e}")
         
-        # Method 4: Unsplash (for simple requests)
+        # Method 3: Lexica API (another backup)
         try:
-            if len(prompt.split()) <= 3:  # Simple prompts only
-                unsplash_url = f"https://source.unsplash.com/512x512/?{requests.utils.quote(prompt)}"
-                response = requests.get(unsplash_url, timeout=15)
-                
-                if response.status_code == 200:
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                        tmp.write(response.content)
-                        logger.info(f"Image from Unsplash: {tmp.name}")
-                        return tmp.name
+            logger.info("Trying Lexica API...")
+            # Use search endpoint to get image URLs
+            search_url = "https://lexica.art/api/v1/search"
+            search_data = {"q": prompt}
+            
+            response = requests.post(search_url, json=search_data, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("images") and len(data["images"]) > 0:
+                    # Get first image
+                    image_url = data["images"][0]["src"]
+                    img_response = requests.get(image_url, timeout=20)
+                    
+                    if img_response.status_code == 200:
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                            tmp.write(img_response.content)
+                            logger.info(f"Generated image via Lexica: {tmp.name}")
+                            return tmp.name
+                            
         except Exception as e:
-            logger.warning(f"Unsplash error: {e}")
+            logger.error(f"Lexica API error: {e}")
         
-        # Final fallback: Create custom image
+        # Final fallback
         logger.info("Using fallback image generation")
         return create_fallback_image(prompt)
             
@@ -470,7 +490,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Send initial message
     msg = await update.message.reply_text(
-        f"✨ *Creating Image:*\n`{prompt}`\n\n⏳ Please wait... This may take 10-20 seconds.",
+        f"✨ *Creating Image:*\n`{prompt}`\n\n⏳ Please wait... This may take 10-30 seconds.",
         parse_mode="Markdown"
     )
     
@@ -479,19 +499,30 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if image_path and os.path.exists(image_path):
         try:
-            # Send the image
-            with open(image_path, 'rb') as photo:
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption=f"🎨 *Generated:* `{prompt}`\n\n✨ Created by StarAI",
+            # Check if file is valid
+            if os.path.getsize(image_path) > 1000:  # At least 1KB
+                # Send the image
+                with open(image_path, 'rb') as photo:
+                    await update.message.reply_photo(
+                        photo=photo,
+                        caption=f"🎨 *Generated:* `{prompt}`\n\n✨ Created by StarAI",
+                        parse_mode="Markdown"
+                    )
+                
+                # Delete the waiting message
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=msg.message_id
+                    )
+                except:
+                    pass
+                    
+            else:
+                await msg.edit_text(
+                    "❌ *Image file is too small or invalid.*\n\nTry a different prompt or try again later.",
                     parse_mode="Markdown"
                 )
-            
-            # Delete the waiting message
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=msg.message_id
-            )
             
         except Exception as e:
             logger.error(f"Send image error: {e}")
@@ -743,7 +774,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(f"🎨 *Creating:* `{prompt}`...", parse_mode="Markdown")
             image_path = generate_image(prompt)
             
-            if image_path and os.path.exists(image_path):
+            if image_path and os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
                 try:
                     with open(image_path, 'rb') as photo:
                         await update.message.reply_photo(
@@ -752,10 +783,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                     
-                    await context.bot.delete_message(
-                        chat_id=update.effective_chat.id,
-                        message_id=msg.message_id
-                    )
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=msg.message_id
+                        )
+                    except:
+                        pass
                 except Exception as e:
                     logger.error(f"Error sending image: {e}")
                     await msg.edit_text("❌ Couldn't send the image. Try `/image` command instead.")
@@ -833,6 +867,9 @@ def main():
         print("Chat features limited without it")
     
     print("✅ Starting StarAI with all features...")
+    print("📸 Image generation: Pollinations.ai + Craiyon + Lexica")
+    print("🎵 Music search: YouTube")
+    print("💬 AI chat: Groq LLaMA 3.1")
     
     # Create application
     try:
