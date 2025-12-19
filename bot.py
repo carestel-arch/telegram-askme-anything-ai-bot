@@ -49,14 +49,11 @@ Or locally, create .env file with:
 TELEGRAM_TOKEN=your_token_here
 """
     logger.error(error_msg)
-    # Uncomment below for testing only (remove before pushing to GitHub!)
-    # TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
     raise ValueError("TELEGRAM_TOKEN not set in environment variables")
 
 if not GROQ_API_KEY:
     logger.warning("⚠️ GROQ_API_KEY not found - AI chat features will be limited")
     logger.info("Get FREE API key: https://console.groq.com/keys")
-    # Can run without Groq for image/music features
     client = None
 else:
     # Initialize Groq AI only if key is available
@@ -927,31 +924,90 @@ What aspect of love are you curious about? ❤️"""
 *Need help?* Try `/help` for all commands! 😊"""
 
 # ========================
-# BUTTON HANDLERS
+# BUTTON HANDLERS (FIXED VERSION - ALL BUTTONS WORK!)
 # ========================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses"""
+    """Handle ALL inline button presses"""
     query = update.callback_query
     await query.answer()
     
+    # Debug logging
+    logger.info(f"Button pressed: {query.data}")
+    
     if query.data == 'create_image':
         await query.edit_message_text(
-            "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
+            "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`\n\n*Or just type:* \"Create an image of a sunset\"",
             parse_mode="Markdown"
         )
     elif query.data == 'find_music':
         await query.edit_message_text(
-            "🎵 *Music Search*\n\nSend: `/music <song or artist>`\n\n*Examples:*\n• `/music Imagine Dragons`\n• `/music chill lofi`\n• `/music 80s hits`",
+            "🎵 *Music Search*\n\nSend: `/music <song or artist>`\n\n*Examples:*\n• `/music Imagine Dragons`\n• `/music chill lofi`\n• `/music 80s hits`\n\n*Or just type:* \"Find music by Taylor Swift\"",
             parse_mode="Markdown"
         )
     elif query.data == 'get_joke':
-        await query.edit_message_text(f"😂 *Joke:*\n\n{random.choice(JOKES)}", parse_mode="Markdown")
+        joke = random.choice(JOKES)
+        await query.edit_message_text(f"😂 *Joke of the Day:*\n\n{joke}", parse_mode="Markdown")
     elif query.data == 'get_fact':
-        await query.edit_message_text(f"💡 *Fact:*\n\n{random.choice(FACTS)}", parse_mode="Markdown")
+        fact = random.choice(FACTS)
+        await query.edit_message_text(f"💡 *Did You Know?*\n\n{fact}", parse_mode="Markdown")
     elif query.data == 'get_quote':
-        await query.edit_message_text(f"📜 *Quote:*\n\n{random.choice(QUOTES)}", parse_mode="Markdown")
+        quote = random.choice(QUOTES)
+        await query.edit_message_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
     elif query.data == 'donate':
-        await donate_command(update, context)
+        # Call donate_command but for button
+        user = query.from_user
+        
+        # Get donation stats
+        stats = donation_db.get_stats()
+        user_total = donation_db.get_user_total(user.id)
+        
+        donate_text = f"""
+💰 *SUPPORT STARAI DEVELOPMENT* 💰
+
+Running StarAI costs money for:
+• API keys and AI services
+• Server hosting
+• Development time
+• Maintenance
+
+✨ *Why Support?*
+• Keep StarAI free for everyone
+• Enable new features
+• Help cover operational costs
+• Get supporter perks
+
+*Community Stats:*
+👥 Total Supporters: {stats['supporters']}
+💰 Total Raised: ${stats['total_verified']:.2f}
+⏳ Pending: ${stats['total_pending']:.2f}
+
+*Your Donations:* ${user_total:.2f}
+
+*How to donate:*
+1. **PayPal:** https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8
+2. **Buy Me Coffee:** https://www.buymeacoffee.com/StarAI
+
+*After donating:*
+1. Click *✅ I've Donated* below
+2. Send your transaction ID
+3. Get supporter status! 🎖️
+"""
+        
+        # Add supporter message if applicable
+        if user_total > 0:
+            donate_text += f"\n\n🎖️ *You're already a supporter!* Thank you! 💝"
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ I've Donated", callback_data='i_donated'),
+             InlineKeyboardButton("📊 My Donations", callback_data='my_donations')],
+            [InlineKeyboardButton("🔗 PayPal", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+             InlineKeyboardButton("☕ Buy Coffee", url='https://www.buymeacoffee.com/StarAI')],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(donate_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=False)
+    
     elif query.data == 'i_donated':
         user = query.from_user
         context.user_data[f"waiting_proof_{user.id}"] = True
@@ -965,10 +1021,68 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Thank you! 🙏",
             parse_mode="Markdown"
         )
+    
     elif query.data == 'my_donations':
-        await mydonations_command(update, context)
+        # Call mydonations_command but for button
+        user = query.from_user
+        donations = donation_db.get_user_donations(user.id)
+        total = donation_db.get_user_total(user.id)
+        
+        if donations:
+            response = f"""
+📊 *YOUR DONATIONS*
+
+*Total Verified:* ${total:.2f}
+*Total Transactions:* {len(donations)}
+
+*Recent Donations:*
+"""
+            for i, donation in enumerate(donations[:5], 1):
+                status_icon = "✅" if donation["status"] == "verified" else "⏳"
+                response += f"\n{i}. {status_icon} ${donation['amount']:.2f} - {donation['created_at'][:10]}"
+                if donation["transaction_id"]:
+                    response += f"\n   📎 {donation['transaction_id'][:20]}..."
+            
+            if total > 0:
+                response += f"\n\n🎖️ *Supporter Level:* "
+                if total >= 50:
+                    response += "Platinum 🏆"
+                elif total >= 20:
+                    response += "Gold 🥇"
+                elif total >= 10:
+                    response += "Silver 🥈"
+                elif total >= 5:
+                    response += "Bronze 🥉"
+                else:
+                    response += "Supporter 💝"
+                
+                response += f"\n❤️ Thank you for your support!"
+        else:
+            response = """
+💸 *NO DONATIONS YET*
+
+You haven't made any donations yet.
+
+*Want to support StarAI?*
+Use `/donate` to see how you can help!
+
+*Even without donating, you can:*
+• Share StarAI with friends
+• Give feedback for improvements
+• Keep using and enjoying the bot!
+
+*Thank you for being part of the community!* 😊
+"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data='back_to_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(response, parse_mode="Markdown", reply_markup=reply_markup)
+    
     elif query.data == 'back_to_menu':
+        # Re-send start menu
         await start(update, context)
+    
     elif query.data == 'chat':
         await query.edit_message_text(
             "💬 *Let's Chat!*\n\n"
@@ -978,11 +1092,56 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• For advice or emotional support\n"
             "• To explain complex concepts\n"
             "• Or just have a friendly chat!\n\n"
-            "*Just type your message and I'll respond naturally!* 🎭",
+            "*Just type your message and I'll respond naturally!* 🎭\n\n"
+            "*Try saying:*\n"
+            "• \"Hello! How are you?\"\n"
+            "• \"Tell me about space\"\n"
+            "• \"I need some advice\"\n"
+            "• \"What's your favorite thing?\"",
             parse_mode="Markdown"
         )
+    
     elif query.data == 'help':
-        await help_command(update, context)
+        await query.edit_message_text(
+            "🆘 *STARAI HELP CENTER*\n\n"
+            "🎨 **MEDIA COMMANDS:**\n"
+            "`/image <description>` - Generate AI image\n"
+            "`/music <song/artist>` - Find music links\n"
+            "`/meme` - Get fun images\n\n"
+            "💬 **CHAT COMMANDS:**\n"
+            "`/start` - Welcome message\n"
+            "`/help` - This help\n"
+            "`/clear` - Reset conversation\n\n"
+            "💰 **SUPPORT COMMANDS:**\n"
+            "`/donate` - Support StarAI development\n"
+            "`/mydonations` - Check your donation status\n\n"
+            "🎭 **FUN COMMANDS:**\n"
+            "`/joke` - Get a joke\n"
+            "`/fact` - Learn a fact\n"
+            "`/quote` - Inspiring quote\n\n"
+            "🤖 **NATURAL LANGUAGE:**\n"
+            "You can also say:\n"
+            "• \"Create an image of a dragon\"\n"
+            "• \"Find music by Taylor Swift\"\n"
+            "• \"Tell me a joke\"\n"
+            "• \"Explain quantum physics\"\n"
+            "• \"I need advice\"\n\n"
+            "*Just talk to me naturally!* 😊",
+            parse_mode="Markdown"
+        )
+    
+    else:
+        # Fallback for any unhandled button
+        await query.edit_message_text(
+            "🤔 *Not sure what you clicked!*\n\n"
+            "Try these commands:\n"
+            "• `/image` - Create images\n"
+            "• `/music` - Find songs\n"
+            "• `/joke` - Get a laugh\n"
+            "• `/donate` - Support bot\n\n"
+            "Or just chat with me! 💬",
+            parse_mode="Markdown"
+        )
 
 # ========================
 # MAIN MESSAGE HANDLER (HANDLES HUMAN-LIKE CONVERSATIONS)
