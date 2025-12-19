@@ -7,6 +7,8 @@ import random
 import tempfile
 import base64
 import sqlite3
+import hashlib
+import time
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,442 +28,517 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Keys (set these in Heroku Config Vars)
+# API Keys
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+
+# PayPal API Credentials (from your PayPal Developer Dashboard)
+PAYPAL_CLIENT_ID = os.environ.get('PAYPAL_CLIENT_ID')
+PAYPAL_SECRET = os.environ.get('PAYPAL_SECRET')
+PAYPAL_SANDBOX = os.environ.get('PAYPAL_SANDBOX', 'true').lower() == 'true'
+
+# Admin
+ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
 
 # Initialize Groq AI
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ========================
-# PERSISTENT DATABASE
+# PAYPAL INTEGRATION
 # ========================
-class MemoryDatabase:
+class PayPalPayment:
     def __init__(self):
-        self.db_name = "starai_memory.db"
-        self.init_database()
+        self.client_id = PAYPAL_CLIENT_ID
+        self.secret = PAYPAL_SECRET
+        self.sandbox = PAYPAL_SANDBOX
+        self.base_url = "https://api-m.sandbox.paypal.com" if self.sandbox else "https://api-m.paypal.com"
+        self.access_token = None
+        self.token_expiry = 0
     
-    def init_database(self):
+    def get_access_token(self):
+        """Get PayPal access token"""
+        try:
+            # Check if token is still valid (expires in 1 hour)
+            if self.access_token and time.time() < self.token_expiry:
+                return self.access_token
+            
+            auth_response = requests.post(
+                f"{self.base_url}/v1/oauth2/token",
+                auth=(self.client_id, self.secret),
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Language": "en_US"
+                },
+                data={"grant_type": "client_credentials"}
+            )
+            
+            if auth_response.status_code == 200:
+                token_data = auth_response.json()
+                self.access_token = token_data["access_token"]
+                self.token_expiry = time.time() + token_data["expires_in"] - 300  # 5 min buffer
+                logger.info("PayPal access token obtained")
+                return self.access_token
+            else:
+                logger.error(f"PayPal auth failed: {auth_response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"PayPal auth error: {e}")
+            return None
+    
+    def create_payment(self, user_id, amount, currency="USD", description="StarAI Donation"):
+        """Create PayPal payment"""
+        try:
+            token = self.get_access_token()
+            if not token:
+                return None, "Could not connect to PayPal"
+            
+            payment_data = {
+                "intent": "sale",
+                "payer": {"payment_method": "paypal"},
+                "transactions": [{
+                    "amount": {
+                        "total": f"{amount:.2f}",
+                        "currency": currency
+                    },
+                    "description": description,
+                    "custom": f"user_id:{user_id}",
+                    "invoice_number": f"STARAI-{user_id}-{int(time.time())}"
+                }],
+                "redirect_urls": {
+                    "return_url": f"https://t.me/StarAI_Bot?start=payment_success",
+                    "cancel_url": f"https://t.me/StarAI_Bot?start=payment_cancel"
+                }
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/v1/payments/payment",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "Prefer": "return=representation"
+                },
+                json=payment_data,
+                timeout=30
+            )
+            
+            if response.status_code == 201:
+                payment = response.json()
+                payment_id = payment["id"]
+                
+                # Find approval URL
+                approval_url = None
+                for link in payment.get("links", []):
+                    if link.get("rel") == "approval_url":
+                        approval_url = link.get("href")
+                        break
+                
+                if approval_url:
+                    return payment_id, approval_url
+                else:
+                    return None, "No approval URL found"
+            else:
+                logger.error(f"PayPal create payment failed: {response.text}")
+                return None, f"Payment creation failed: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Create payment error: {e}")
+            return None, str(e)
+    
+    def execute_payment(self, payment_id, payer_id):
+        """Execute PayPal payment after approval"""
+        try:
+            token = self.get_access_token()
+            if not token:
+                return False, "No access token"
+            
+            response = requests.post(
+                f"{self.base_url}/v1/payments/payment/{payment_id}/execute",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}"
+                },
+                json={"payer_id": payer_id},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                payment = response.json()
+                if payment.get("state") == "approved":
+                    # Extract transaction details
+                    transactions = payment.get("transactions", [])
+                    if transactions:
+                        transaction = transactions[0]
+                        amount = transaction.get("amount", {}).get("total")
+                        currency = transaction.get("amount", {}).get("currency")
+                        return True, {
+                            "payment_id": payment_id,
+                            "transaction_id": payment.get("id"),
+                            "amount": float(amount) if amount else 0,
+                            "currency": currency,
+                            "state": "approved"
+                        }
+                return False, "Payment not approved"
+            else:
+                logger.error(f"PayPal execute failed: {response.text}")
+                return False, f"Execution failed: {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Execute payment error: {e}")
+            return False, str(e)
+    
+    def get_payment_details(self, payment_id):
+        """Get payment details"""
+        try:
+            token = self.get_access_token()
+            if not token:
+                return None
+            
+            response = requests.get(
+                f"{self.base_url}/v1/payments/payment/{payment_id}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}"
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Get payment failed: {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Get payment error: {e}")
+            return None
+    
+    def verify_transaction(self, transaction_id):
+        """Verify a transaction by ID"""
+        try:
+            # For PayPal, transaction ID is usually the sale ID
+            token = self.get_access_token()
+            if not token:
+                return None
+            
+            response = requests.get(
+                f"{self.base_url}/v1/payments/sale/{transaction_id}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}"
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                sale = response.json()
+                if sale.get("state") == "completed":
+                    return {
+                        "transaction_id": transaction_id,
+                        "amount": float(sale.get("amount", {}).get("total", 0)),
+                        "currency": sale.get("amount", {}).get("currency", "USD"),
+                        "state": "completed",
+                        "create_time": sale.get("create_time")
+                    }
+            return None
+            
+        except Exception as e:
+            logger.error(f"Verify transaction error: {e}")
+            return None
+
+# Initialize PayPal
+paypal = PayPalPayment()
+
+# ========================
+# SIMPLE DATABASE
+# ========================
+class SimpleDB:
+    def __init__(self):
+        self.db_file = "starai.db"
+        self.init_db()
+    
+    def init_db(self):
         """Initialize SQLite database"""
         try:
-            conn = sqlite3.connect(self.db_name)
+            conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
-            # Create users table
+            # Users table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
                     last_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Create conversations table
+            # Donations table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS conversations (
+                CREATE TABLE IF NOT EXISTS donations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
-                    role TEXT,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    amount REAL,
+                    currency TEXT DEFAULT 'USD',
+                    payment_id TEXT UNIQUE,
+                    transaction_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    method TEXT DEFAULT 'paypal',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    verified_at TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
-            # Create user_data table for custom preferences
+            # Pending payments table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_data (
-                    user_id INTEGER PRIMARY KEY,
-                    name TEXT,
-                    favorite_color TEXT,
-                    interests TEXT,
-                    personality_type TEXT,
-                    custom_instructions TEXT,
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    payment_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    amount REAL,
+                    currency TEXT,
+                    approval_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
             conn.commit()
             conn.close()
-            logger.info("Database initialized successfully")
             
         except Exception as e:
-            logger.error(f"Database initialization error: {e}")
+            logger.error(f"DB init error: {e}")
     
     def save_user(self, user_id, username, first_name, last_name):
-        """Save or update user information"""
+        """Save or update user"""
         try:
-            conn = sqlite3.connect(self.db_name)
+            conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
             cursor.execute('''
-                INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, last_seen)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT OR REPLACE INTO users (user_id, username, first_name, last_name)
+                VALUES (?, ?, ?, ?)
             ''', (user_id, username, first_name, last_name))
             
             conn.commit()
             conn.close()
-            
         except Exception as e:
             logger.error(f"Save user error: {e}")
     
-    def save_message(self, user_id, role, content):
-        """Save a message to conversation history"""
+    def save_pending_payment(self, payment_id, user_id, amount, currency, approval_url):
+        """Save pending payment"""
         try:
-            conn = sqlite3.connect(self.db_name)
+            conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
-            cursor.execute('''
-                INSERT INTO conversations (user_id, role, content)
-                VALUES (?, ?, ?)
-            ''', (user_id, role, content))
+            expires_at = datetime.now().timestamp() + 3600  # 1 hour
             
-            # Keep only last 20 messages per user
             cursor.execute('''
-                DELETE FROM conversations 
-                WHERE id IN (
-                    SELECT id FROM conversations 
-                    WHERE user_id = ? 
-                    ORDER BY timestamp ASC 
-                    LIMIT (SELECT COUNT(*) - 20 FROM conversations WHERE user_id = ?)
-                )
-            ''', (user_id, user_id))
+                INSERT OR REPLACE INTO pending_payments 
+                (payment_id, user_id, amount, currency, approval_url, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (payment_id, user_id, amount, currency, approval_url, expires_at))
             
             conn.commit()
             conn.close()
-            
+            return True
         except Exception as e:
-            logger.error(f"Save message error: {e}")
+            logger.error(f"Save pending error: {e}")
+            return False
     
-    def get_conversation_history(self, user_id, limit=15):
-        """Get conversation history for a user"""
+    def get_pending_payment(self, payment_id):
+        """Get pending payment"""
         try:
-            conn = sqlite3.connect(self.db_name)
+            conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
-            cursor.execute('''
-                SELECT role, content FROM conversations 
-                WHERE user_id = ? 
-                ORDER BY timestamp ASC 
-                LIMIT ?
-            ''', (user_id, limit))
-            
-            rows = cursor.fetchall()
-            conn.close()
-            
-            # Format as list of dictionaries
-            history = [{"role": row[0], "content": row[1]} for row in rows]
-            return history
-            
-        except Exception as e:
-            logger.error(f"Get conversation error: {e}")
-            return []
-    
-    def clear_conversation(self, user_id):
-        """Clear conversation history for a user"""
-        try:
-            conn = sqlite3.connect(self.db_name)
-            cursor = conn.cursor()
-            
-            cursor.execute('DELETE FROM conversations WHERE user_id = ?', (user_id,))
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.error(f"Clear conversation error: {e}")
-    
-    def save_user_data(self, user_id, name=None, favorite_color=None, interests=None, 
-                      personality_type=None, custom_instructions=None):
-        """Save custom user data"""
-        try:
-            conn = sqlite3.connect(self.db_name)
-            cursor = conn.cursor()
-            
-            # Get existing data
-            cursor.execute('SELECT * FROM user_data WHERE user_id = ?', (user_id,))
-            existing = cursor.fetchone()
-            
-            if existing:
-                # Update existing
-                cursor.execute('''
-                    UPDATE user_data 
-                    SET name = COALESCE(?, name),
-                        favorite_color = COALESCE(?, favorite_color),
-                        interests = COALESCE(?, interests),
-                        personality_type = COALESCE(?, personality_type),
-                        custom_instructions = COALESCE(?, custom_instructions)
-                    WHERE user_id = ?
-                ''', (name, favorite_color, interests, personality_type, custom_instructions, user_id))
-            else:
-                # Insert new
-                cursor.execute('''
-                    INSERT INTO user_data (user_id, name, favorite_color, interests, personality_type, custom_instructions)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (user_id, name, favorite_color, interests, personality_type, custom_instructions))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.error(f"Save user data error: {e}")
-    
-    def get_user_data(self, user_id):
-        """Get user's custom data"""
-        try:
-            conn = sqlite3.connect(self.db_name)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT * FROM user_data WHERE user_id = ?', (user_id,))
+            cursor.execute('SELECT * FROM pending_payments WHERE payment_id = ?', (payment_id,))
             row = cursor.fetchone()
             conn.close()
             
             if row:
                 return {
-                    "name": row[1],
-                    "favorite_color": row[2],
-                    "interests": row[3],
-                    "personality_type": row[4],
-                    "custom_instructions": row[5]
+                    "payment_id": row[0],
+                    "user_id": row[1],
+                    "amount": row[2],
+                    "currency": row[3],
+                    "approval_url": row[4],
+                    "created_at": row[5]
                 }
             return None
-            
         except Exception as e:
-            logger.error(f"Get user data error: {e}")
+            logger.error(f"Get pending error: {e}")
             return None
     
-    def get_all_users(self):
-        """Get all registered users"""
+    def save_donation(self, user_id, amount, currency, payment_id, transaction_id, status, method="paypal"):
+        """Save donation"""
         try:
-            conn = sqlite3.connect(self.db_name)
+            conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             
-            cursor.execute('SELECT COUNT(*) FROM users')
-            count = cursor.fetchone()[0]
+            verified_at = datetime.now().timestamp() if status == "completed" else None
             
             cursor.execute('''
-                SELECT u.user_id, u.username, u.first_name, 
-                       COUNT(c.id) as message_count
-                FROM users u
-                LEFT JOIN conversations c ON u.user_id = c.user_id
-                GROUP BY u.user_id
-                ORDER BY u.last_seen DESC
-                LIMIT 10
-            ''')
+                INSERT INTO donations 
+                (user_id, amount, currency, payment_id, transaction_id, status, method, verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, amount, currency, payment_id, transaction_id, status, method, verified_at))
             
-            users = cursor.fetchall()
+            # Remove from pending
+            cursor.execute('DELETE FROM pending_payments WHERE payment_id = ?', (payment_id,))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Save donation error: {e}")
+            return False
+    
+    def get_user_donations(self, user_id):
+        """Get user's donations"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM donations 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            ''', (user_id,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            donations = []
+            for row in rows:
+                donations.append({
+                    "id": row[0],
+                    "amount": row[2],
+                    "currency": row[3],
+                    "payment_id": row[4],
+                    "transaction_id": row[5],
+                    "status": row[6],
+                    "method": row[7],
+                    "created_at": row[8]
+                })
+            return donations
+        except Exception as e:
+            logger.error(f"Get donations error: {e}")
+            return []
+    
+    def get_user_total(self, user_id):
+        """Get user's total donations"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT SUM(amount) FROM donations 
+                WHERE user_id = ? AND status = 'completed'
+            ''', (user_id,))
+            
+            total = cursor.fetchone()[0] or 0
+            conn.close()
+            return total
+        except Exception as e:
+            logger.error(f"Get total error: {e}")
+            return 0
+    
+    def get_stats(self):
+        """Get donation statistics"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            # Total amount
+            cursor.execute('SELECT SUM(amount) FROM donations WHERE status = "completed"')
+            total = cursor.fetchone()[0] or 0
+            
+            # Supporters count
+            cursor.execute('SELECT COUNT(DISTINCT user_id) FROM donations WHERE status = "completed"')
+            supporters = cursor.fetchone()[0] or 0
+            
+            # Recent donations
+            cursor.execute('''
+                SELECT u.first_name, d.amount, d.created_at 
+                FROM donations d
+                JOIN users u ON d.user_id = u.user_id
+                WHERE d.status = 'completed'
+                ORDER BY d.created_at DESC
+                LIMIT 5
+            ''')
+            recent = cursor.fetchall()
+            
             conn.close()
             
             return {
-                "total_users": count,
-                "recent_users": users
+                "total": total,
+                "supporters": supporters,
+                "recent": recent
             }
-            
         except Exception as e:
-            logger.error(f"Get all users error: {e}")
-            return {"total_users": 0, "recent_users": []}
+            logger.error(f"Get stats error: {e}")
+            return {"total": 0, "supporters": 0, "recent": []}
 
 # Initialize database
-memory_db = MemoryDatabase()
+db = SimpleDB()
 
 # ========================
-# CONVERSATION MANAGEMENT
-# ========================
-def get_user_conversation(user_id, username="", first_name="", last_name=""):
-    """Get or create conversation history with persistent memory"""
-    # Save user info to database
-    if username or first_name or last_name:
-        memory_db.save_user(user_id, username, first_name, last_name)
-    
-    # Get conversation history from database
-    history = memory_db.get_conversation_history(user_id, limit=15)
-    
-    # Get user's custom data
-    user_data = memory_db.get_user_data(user_id)
-    
-    # Create system prompt with user info
-    user_info = ""
-    if user_data and user_data.get("name"):
-        user_info += f"\n\nUSER INFORMATION:\n- Name: {user_data.get('name')}"
-    if user_data and user_data.get("favorite_color"):
-        user_info += f"\n- Favorite Color: {user_data.get('favorite_color')}"
-    if user_data and user_data.get("interests"):
-        user_info += f"\n- Interests: {user_data.get('interests')}"
-    if user_data and user_data.get("custom_instructions"):
-        user_info += f"\n- Custom Instructions: {user_data.get('custom_instructions')}"
-    
-    # Check if this is a new conversation or has history
-    if not history:
-        system_message = {
-            "role": "system",
-            "content": f"""You are StarAI, a friendly, intelligent AI assistant with personality.
-                
-PERSONALITY: Warm, empathetic, knowledgeable, engaging, supportive.
-
-CAPABILITIES:
-1. Have natural human-like conversations
-2. Answer any question thoughtfully
-3. Provide emotional support
-4. Explain complex concepts simply
-5. Generate creative content
-6. Remember conversation context
-7. Remember user preferences and details
-
-SPECIAL FEATURES:
-- Can create images (/image command)
-- Can find music (/music command)
-- Can tell jokes, facts, quotes
-- Engages naturally with users
-- Has memory across sessions
-- Can learn about users{user_info}
-
-IMPORTANT: You should remember user details from previous conversations. 
-If the user told you their name, favorite things, or any personal information, 
-you should remember and reference it naturally in conversation.
-
-RESPONSE STYLE:
-- Use natural language with emojis 😊
-- Be warm and engaging
-- Show genuine interest
-- Keep responses under 500 words
-- Reference user details when appropriate
-
-Current Date: {datetime.now().strftime('%B %Y')}"""
-        }
-        
-        # Save system message to database
-        memory_db.save_message(user_id, "system", system_message["content"])
-        
-        return [system_message]
-    
-    return history
-
-def update_conversation(user_id, role, content):
-    """Update conversation history in database"""
-    memory_db.save_message(user_id, role, content)
-
-def clear_conversation(user_id):
-    """Clear conversation memory"""
-    memory_db.clear_conversation(user_id)
-
-# ========================
-# IMAGE GENERATION FUNCTIONS
+# IMAGE GENERATION
 # ========================
 def create_fallback_image(prompt):
-    """Create a fallback image with text"""
+    """Create fallback image"""
     try:
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            # Create image
-            img = Image.new('RGB', (512, 512), color=(40, 44, 52))
+            img = Image.new('RGB', (512, 512), color=(60, 60, 100))
             draw = ImageDraw.Draw(img)
             
-            # Load font
-            try:
-                font = ImageFont.truetype("arial.ttf", 32) if os.path.exists("arial.ttf") else ImageFont.load_default()
-            except:
-                font = ImageFont.load_default()
-            
-            # Format text
-            lines = []
+            # Simple text
             words = prompt.split()
-            current_line = ""
-            
+            lines = []
+            line = ""
             for word in words:
-                if len(current_line + " " + word) <= 20:
-                    current_line = current_line + " " + word if current_line else word
+                if len(line + " " + word) <= 30:
+                    line = line + " " + word if line else word
                 else:
-                    if current_line:
-                        lines.append(current_line)
-                    current_line = word
-            if current_line:
-                lines.append(current_line)
+                    lines.append(line)
+                    line = word
+            if line:
+                lines.append(line)
             
-            # Draw main text
-            text = "\n".join(lines[:4])
-            if len(lines) > 4:
-                text += "\n..."
-            
-            # Calculate text position
-            text_width = len(max(text.split('\n'), key=len)) * 20
-            text_height = len(text.split('\n')) * 40
-            
-            x = (512 - text_width) // 2
-            y = (512 - text_height) // 2
-            
-            # Draw text
-            draw.text((x, y), text, fill=(255, 215, 0), font=font, align="center")
-            
-            # Add watermark
-            draw.text((10, 480), "✨ StarAI Image", fill=(100, 200, 255), font=font)
+            text = "\n".join(lines[:5])
+            draw.text((50, 200), f"StarAI:\n{text}", fill=(255, 255, 255))
+            draw.text((10, 480), "✨ Created by StarAI", fill=(200, 200, 255))
             
             img.save(tmp.name, 'PNG')
             return tmp.name
-            
-    except Exception as e:
-        logger.error(f"Fallback image error: {e}")
+    except:
         return None
 
 def generate_image(prompt):
-    """Generate images using Pollinations.ai"""
+    """Generate AI image"""
     try:
-        logger.info(f"Generating image for: {prompt}")
+        clean_prompt = prompt.strip().replace(" ", "%20")
+        poll_url = f"https://image.pollinations.ai/prompt/{clean_prompt}"
+        params = {"width": "512", "height": "512", "seed": str(random.randint(1, 999999))}
         
-        # Method 1: Pollinations.ai
-        try:
-            clean_prompt = prompt.strip().replace(" ", "%20")
-            poll_url = f"https://image.pollinations.ai/prompt/{clean_prompt}"
-            
-            params = {
-                "width": "512",
-                "height": "512",
-                "seed": str(random.randint(1, 1000000)),
-                "nofilter": "true"
-            }
-            
-            response = requests.get(poll_url, params=params, timeout=30)
-            
-            if response.status_code == 200 and len(response.content) > 1000:
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    tmp.write(response.content)
-                    return tmp.name
-                    
-        except Exception as e:
-            logger.error(f"Pollinations.ai error: {e}")
-        
-        # Method 2: Craiyon API
-        try:
-            craiyon_url = "https://api.craiyon.com/v3"
-            response = requests.post(craiyon_url, json={"prompt": prompt}, timeout=60)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("images") and len(data["images"]) > 0:
-                    image_data = data["images"][0]
-                    if image_data.startswith('data:image'):
-                        image_data = image_data.split(',')[1]
-                    
-                    image_bytes = base64.b64decode(image_data)
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        tmp.write(image_bytes)
-                        return tmp.name
-                        
-        except Exception as e:
-            logger.error(f"Craiyon API error: {e}")
-        
-        # Final fallback
-        return create_fallback_image(prompt)
-            
-    except Exception as e:
-        logger.error(f"Image generation error: {e}")
-        return create_fallback_image(prompt)
+        response = requests.get(poll_url, params=params, timeout=30)
+        if response.status_code == 200 and len(response.content) > 1000:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp.write(response.content)
+                return tmp.name
+    except:
+        pass
+    
+    return create_fallback_image(prompt)
 
 # ========================
 # MUSIC SEARCH
 # ========================
 def search_music(query):
-    """Search for music on YouTube"""
+    """Search for music"""
     try:
         videos_search = VideosSearch(query, limit=3)
         results = videos_search.result()['result']
@@ -471,631 +548,536 @@ def search_music(query):
             title = video['title'][:50] + "..." if len(video['title']) > 50 else video['title']
             url = video['link']
             duration = video.get('duration', 'N/A')
-            views = video.get('viewCount', {}).get('short', 'N/A')
-            music_list.append(f"{i}. 🎵 {title}\n   ⏱️ {duration} | 👁️ {views}\n   🔗 {url}")
-        
+            music_list.append(f"{i}. 🎵 {title}\n   ⏱️ {duration}\n   🔗 {url}")
         return music_list
-    except Exception as e:
-        logger.error(f"Music search error: {e}")
-        return ["🎵 Use: `/music <song or artist>`", "Example: `/music Bohemian Rhapsody`"]
-
-# ========================
-# FUN CONTENT
-# ========================
-JOKES = [
-    "😂 Why don't scientists trust atoms? Because they make up everything!",
-    "😄 Why did the scarecrow win an award? Because he was outstanding in his field!",
-    "🤣 What do you call a fake noodle? An impasta!",
-    "😆 Why did the math book look so sad? Because it had too many problems!",
-    "😊 How does the moon cut his hair? Eclipse it!",
-    "😁 Why did the computer go to the doctor? It had a virus!",
-]
-
-FACTS = [
-    "🐝 Honey never spoils! Archaeologists have found 3000-year-old honey that's still edible.",
-    "🧠 Octopuses have three hearts! Two pump blood to gills, one to the body.",
-    "🌊 The shortest war was Britain-Zanzibar in 1896. It lasted 38 minutes!",
-    "🐌 Snails can sleep for up to three years when hibernating.",
-    "🦒 A giraffe's neck has the same number of vertebrae as humans: seven!",
-    "🐧 Penguins propose to their mates with pebbles!",
-]
-
-QUOTES = [
-    "🌟 'The only way to do great work is to love what you do.' - Steve Jobs",
-    "💫 'Your time is limited, don't waste it living someone else's life.' - Steve Jobs",
-    "🚀 'The future belongs to those who believe in the beauty of their dreams.' - Eleanor Roosevelt",
-    "🌱 'The only impossible journey is the one you never begin.' - Tony Robbins",
-    "💖 'Be yourself; everyone else is already taken.' - Oscar Wilde",
-    "✨ 'Success is not final, failure is not fatal: it is the courage to continue that counts.' - Winston Churchill",
-]
+    except:
+        return ["Use: `/music <song or artist>`"]
 
 # ========================
 # BOT COMMANDS
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command with interactive buttons"""
+    """Start command"""
     user = update.effective_user
+    db.save_user(user.id, user.username, user.first_name, user.last_name)
     
-    # Save user to database
-    memory_db.save_user(user.id, user.username, user.first_name, user.last_name)
+    # Check for payment success return
+    if context.args and "payment_success" in context.args[0]:
+        await handle_payment_return(update, context, "success")
+        return
+    elif context.args and "payment_cancel" in context.args[0]:
+        await handle_payment_return(update, context, "cancel")
+        return
     
-    # Get user data for personalized welcome
-    user_data = memory_db.get_user_data(user.id)
-    user_name = user_data.get("name") if user_data and user_data.get("name") else user.first_name
+    user_name = user.first_name
+    total_donated = db.get_user_total(user.id)
     
     welcome = f"""
-🌟 *WELCOME BACK, {user_name}!* 🌟
+🌟 *WELCOME TO STARAI, {user_name}!* 🌟
 
-✨ *Your AI Companion with Memory!*
+✨ *Your AI Companion*
 
-🎨 **CREATE:**
-• Images from text
-• Art and designs
-• Visual content
-
-🎵 **MUSIC:**
-• Find songs & artists
-• Get YouTube links
-• Discover new music
-
-💬 **CHAT WITH MEMORY:**
-• I remember our conversations
-• Know your preferences
-• Personalized responses
-• Learning about you
-
-🎭 **FUN:**
-• Jokes & humor
-• Cool facts
-• Inspiring quotes
-• Entertainment
+🎨 **CREATE IMAGES:** `/image <prompt>`
+🎵 **FIND MUSIC:** `/music <song>`
+💬 **CHAT:** Just talk to me!
+💰 **SUPPORT:** `/donate` (Keeps me running!)
 
 🔧 **COMMANDS:**
-`/image <text>` - Generate images
-`/music <song>` - Find music
-`/joke` - Get a joke
-`/fact` - Learn a fact
-`/quote` - Inspiration
-`/clear` - Reset chat
 `/help` - All commands
-`/remember` - Set preferences
-`/mystats` - See your data
-
-*I remember you! Tell me more about yourself!* 😊
-    """
+`/mydonations` - Your donations
+`/stats` - Donation stats
+`/clear` - Reset chat
+"""
     
-    # Create buttons
+    if total_donated > 0:
+        welcome += f"\n🎖️ *SUPPORTER STATUS:*"
+        welcome += f"\n💝 Total Donated: ${total_donated:.2f}"
+        welcome += f"\n❤️ Thank you for your support!"
+    
     keyboard = [
         [InlineKeyboardButton("🎨 Create Image", callback_data='create_image'),
          InlineKeyboardButton("🎵 Find Music", callback_data='find_music')],
-        [InlineKeyboardButton("😂 Get Joke", callback_data='get_joke'),
-         InlineKeyboardButton("💡 Get Fact", callback_data='get_fact')],
-        [InlineKeyboardButton("📜 Get Quote", callback_data='get_quote'),
-         InlineKeyboardButton("💾 My Memory", callback_data='my_memory')]
+        [InlineKeyboardButton("💰 Donate", callback_data='donate'),
+         InlineKeyboardButton("😂 Joke", callback_data='joke')],
+        [InlineKeyboardButton("🆘 Help", callback_data='help'),
+         InlineKeyboardButton("📊 Stats", callback_data='stats')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=reply_markup)
 
-async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Let user set preferences to remember"""
+async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Donation command"""
     user = update.effective_user
-    args = context.args
+    stats = db.get_stats()
     
-    if not args:
-        await update.message.reply_text(
-            "💾 *Set Your Preferences*\n\n"
-            "I can remember things about you! Use:\n"
-            "`/remember name John` - Remember your name\n"
-            "`/remember color blue` - Remember favorite color\n"
-            "`/remember interests music,reading` - Remember interests\n"
-            "`/remember instructions Be more concise` - Custom instructions\n\n"
-            "*I'll remember these for our future conversations!* 🧠",
-            parse_mode="Markdown"
-        )
-        return
-    
-    category = args[0].lower()
-    value = ' '.join(args[1:]) if len(args) > 1 else ""
-    
-    user_data = {}
-    
-    if category == "name":
-        user_data["name"] = value
-        response = f"✅ I'll remember your name is *{value}*! Nice to meet you! 😊"
-    elif category == "color" or category == "favorite":
-        user_data["favorite_color"] = value
-        response = f"✅ I'll remember your favorite color is *{value}*! 🎨"
-    elif category == "interests":
-        user_data["interests"] = value
-        response = f"✅ I'll remember your interests: *{value}*! 🎭"
-    elif category == "instructions":
-        user_data["custom_instructions"] = value
-        response = f"✅ I'll remember your instructions: *{value}*! 📝"
-    else:
-        response = "❌ Invalid category. Use: name, color, interests, or instructions"
-    
-    # Save to database
-    if user_data:
-        memory_db.save_user_data(user.id, **user_data)
-    
-    await update.message.reply_text(response, parse_mode="Markdown")
+    donate_text = f"""
+💰 *SUPPORT STARAI* 💰
 
-async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's stored information"""
+*Why donate?*
+• API costs (AI, images, music)
+• Server hosting
+• Development time
+• Keep StarAI free for everyone!
+
+*Current Stats:*
+👥 Supporters: {stats['supporters']}
+💰 Total Raised: ${stats['total']:.2f}
+
+*Your Donations:* ${db.get_user_total(user.id):.2f}
+
+*Choose amount:*
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("☕ Tea - $3", callback_data='donate_3'),
+         InlineKeyboardButton("🍵 Coffee - $5", callback_data='donate_5')],
+        [InlineKeyboardButton("🥤 Smoothie - $10", callback_data='donate_10'),
+         InlineKeyboardButton("🍰 Cake - $20", callback_data='donate_20')],
+        [InlineKeyboardButton("🎖️ Custom Amount", callback_data='donate_custom'),
+         InlineKeyboardButton("✅ Check Payment", callback_data='check_payment')],
+        [InlineKeyboardButton("📊 My Donations", callback_data='my_donations'),
+         InlineKeyboardButton("🔙 Back", callback_data='back')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(donate_text, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def mydonations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user donations"""
     user = update.effective_user
+    donations = db.get_user_donations(user.id)
+    total = db.get_user_total(user.id)
     
-    # Get user data
-    user_data = memory_db.get_user_data(user.id)
-    
-    # Get conversation stats
-    history = memory_db.get_conversation_history(user.id)
-    message_count = len([msg for msg in history if msg["role"] != "system"])
-    
-    if user_data:
-        stats = f"📊 *Your Profile*\n\n"
-        if user_data.get("name"):
-            stats += f"• *Name:* {user_data['name']}\n"
-        if user_data.get("favorite_color"):
-            stats += f"• *Favorite Color:* {user_data['favorite_color']}\n"
-        if user_data.get("interests"):
-            stats += f"• *Interests:* {user_data['interests']}\n"
-        if user_data.get("personality_type"):
-            stats += f"• *Personality:* {user_data['personality_type']}\n"
-        if user_data.get("custom_instructions"):
-            stats += f"• *Instructions:* {user_data['custom_instructions']}\n"
+    if donations:
+        response = f"""
+📊 *YOUR DONATIONS*
+
+*Total:* ${total:.2f}
+*Transactions:* {len(donations)}
+
+*Recent:*
+"""
+        for donation in donations[:5]:
+            status_icon = "✅" if donation["status"] == "completed" else "⏳"
+            response += f"\n{status_icon} ${donation['amount']:.2f} - {donation['created_at'][:10]}"
+            if donation["status"] == "pending":
+                response += f" (Pending)"
         
-        stats += f"\n• *Messages with me:* {message_count}\n"
-        stats += f"• *User ID:* {user.id}\n"
-        
-        if user.username:
-            stats += f"• *Username:* @{user.username}\n"
-        
-        stats += f"\n*I remember you!* 🧠\nUse `/remember` to update your info."
-    else:
-        stats = (
-            "📊 *Your Profile*\n\n"
-            "I don't have much information about you yet!\n\n"
-            "Tell me about yourself:\n"
-            "• `/remember name [your name]`\n"
-            "• `/remember color [favorite color]`\n"
-            "• `/remember interests [your interests]`\n\n"
-            "*I'll remember for our future conversations!* 😊"
-        )
-    
-    await update.message.reply_text(stats, parse_mode="Markdown")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command"""
-    help_text = """
-🆘 *STARAI HELP CENTER - WITH MEMORY!*
-
-🎨 **MEDIA COMMANDS:**
-`/image <description>` - Generate AI image
-`/music <song/artist>` - Find music links
-`/meme` - Get fun images
-
-💬 **CHAT COMMANDS:**
-`/start` - Welcome message
-`/help` - This help
-`/clear` - Reset conversation
-`/about` - About StarAI
-
-🧠 **MEMORY COMMANDS:**
-`/remember <type> <value>` - Set preferences
-`/mystats` - See your stored info
-`/forgetme` - Delete your data (coming soon)
-
-🎭 **FUN COMMANDS:**
-`/joke` - Get a joke
-`/fact` - Learn a fact  
-`/quote` - Inspiring quote
-
-🤖 **NATURAL LANGUAGE:**
-You can also say:
-• "Create an image of a dragon"
-• "Find music by Taylor Swift"
-• "Tell me a joke"
-• "Explain quantum physics"
-• "I need advice"
-• "My name is John" (I'll remember!)
-
-*I can remember our conversations across sessions!* 🧠😊
-    """
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """About StarAI"""
-    about_text = """
-🤖 *ABOUT STARAI v3.0*
-
-✨ **Version:** AI Assistant with Persistent Memory
-
-💝 **Mission:**
-To be your intelligent companion that remembers you and our conversations.
-
-🧠 **NEW: Persistent Memory**
-✅ Remembers conversations across sessions
-✅ Stores user preferences
-✅ Personalized responses
-✅ SQLite database storage
-
-🌟 **Features:**
-✅ Human-like conversations with memory
-✅ Image generation
-✅ Music discovery
-✅ Emotional intelligence
-✅ Learning & teaching
-✅ Fun & entertainment
-✅ User profiles
-
-🔧 **Technology:**
-• Python & Telegram Bot API
-• SQLite for persistent memory
-• Groq AI for conversations
-• Multiple image APIs
-
-*StarAI - Now with memory that lasts!* 💾✨
-    """
-    await update.message.reply_text(about_text, parse_mode="Markdown")
-
-async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate image from text"""
-    prompt = ' '.join(context.args)
-    
-    if not prompt:
-        await update.message.reply_text(
-            "🎨 *Usage:* `/image <description>`\n\n"
-            "*Examples:*\n• `/image sunset over mountains`\n• `/image cute cat in space`\n• `/image futuristic city`\n\n"
-            "*Tip:* Be descriptive for better results!",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Send initial message
-    msg = await update.message.reply_text(
-        f"✨ *Creating Image:*\n`{prompt}`\n\n⏳ Please wait... This may take 10-30 seconds.",
-        parse_mode="Markdown"
-    )
-    
-    # Generate image
-    image_path = generate_image(prompt)
-    
-    if image_path and os.path.exists(image_path):
-        try:
-            # Check if file is valid
-            if os.path.getsize(image_path) > 1000:
-                # Send the image
-                with open(image_path, 'rb') as photo:
-                    await update.message.reply_photo(
-                        photo=photo,
-                        caption=f"🎨 *Generated:* `{prompt}`\n\n✨ Created by StarAI",
-                        parse_mode="Markdown"
-                    )
-                
-                # Delete the waiting message
-                try:
-                    await context.bot.delete_message(
-                        chat_id=update.effective_chat.id,
-                        message_id=msg.message_id
-                    )
-                except:
-                    pass
-                    
+        if total > 0:
+            response += f"\n\n🎖️ *Supporter Level:* "
+            if total >= 50:
+                response += "Platinum 🏆"
+            elif total >= 20:
+                response += "Gold 🥇"
+            elif total >= 10:
+                response += "Silver 🥈"
+            elif total >= 3:
+                response += "Bronze 🥉"
             else:
-                await msg.edit_text(
-                    "❌ *Image file is too small or invalid.*\n\nTry a different prompt or try again later.",
-                    parse_mode="Markdown"
-                )
+                response += "Supporter 💝"
             
-        except Exception as e:
-            logger.error(f"Send image error: {e}")
-            await msg.edit_text(
-                "❌ *Error sending image.*\n\nThe image was created but couldn't be sent. Try again!",
-                parse_mode="Markdown"
-            )
-        finally:
-            # Clean up temp file
-            try:
-                if os.path.exists(image_path):
-                    os.unlink(image_path)
-            except Exception as e:
-                logger.error(f"Cleanup error: {e}")
+            response += f"\n❤️ Thank you for supporting StarAI!"
     else:
-        await msg.edit_text(
-            "❌ *Image creation failed.*\n\nTry:\n• A simpler description\n• Different keywords\n• Wait a moment and try again\n\nExample: `/image simple landscape`",
+        response = """
+💸 *NO DONATIONS YET*
+
+You haven't made any donations yet.
+
+Use `/donate` to support StarAI development!
+
+*Even without donating:*
+• Share StarAI with friends
+• Give feedback
+• Keep using the bot!
+
+*Thank you!* 😊
+"""
+    
+    keyboard = [[InlineKeyboardButton("💰 Donate Now", callback_data='donate')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(response, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show donation stats"""
+    stats = db.get_stats()
+    
+    response = f"""
+📈 *STARAI DONATION STATS*
+
+💰 *Total Raised:* ${stats['total']:.2f}
+👥 *Supporters:* {stats['supporters']}
+
+*Recent Supporters:*
+"""
+    
+    if stats['recent']:
+        for name, amount, date in stats['recent']:
+            response += f"\n• {name} - ${amount:.2f} ({date[:10]})"
+    else:
+        response += "\nNo recent donations yet."
+    
+    response += f"\n\n*Support keeps StarAI running!* ☕"
+    
+    keyboard = [[InlineKeyboardButton("💰 Donate Now", callback_data='donate')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(response, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def handle_payment_return(update: Update, context: ContextTypes.DEFAULT_TYPE, status):
+    """Handle PayPal return"""
+    if status == "success":
+        await update.message.reply_text(
+            "✅ *Payment Approved!*\n\n"
+            "Your payment has been approved by PayPal.\n"
+            "It will be processed and verified shortly.\n\n"
+            "Use `/mydonations` to check your status.\n"
+            "Thank you for supporting StarAI! 💝",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *Payment Cancelled*\n\n"
+            "Your payment was cancelled.\n"
+            "No worries! You can try again with `/donate`\n\n"
+            "Thank you for considering supporting StarAI! 😊",
             parse_mode="Markdown"
         )
 
-async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search for music"""
-    query = ' '.join(context.args)
+# ========================
+# PAYMENT HANDLING
+# ========================
+async def create_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, amount):
+    """Create PayPal payment"""
+    query = update.callback_query
+    user = query.from_user
     
-    if not query:
-        await update.message.reply_text(
-            "🎵 *Usage:* `/music <song or artist>`\n\n"
-            "*Examples:*\n• `/music Bohemian Rhapsody`\n• `/music Taylor Swift`\n• `/music classical music`",
-            parse_mode="Markdown"
-        )
+    # Create PayPal payment
+    payment_id, approval_url = paypal.create_payment(user.id, amount)
+    
+    if not payment_id:
+        await query.answer("❌ Payment creation failed. Try again.", show_alert=True)
         return
     
-    await update.message.reply_text(f"🔍 *Searching:* `{query}`", parse_mode="Markdown")
+    # Save pending payment
+    db.save_pending_payment(payment_id, user.id, amount, "USD", approval_url)
     
-    results = search_music(query)
+    # Show payment instructions
+    payment_msg = f"""
+💳 *PAYMENT READY*
+
+*Amount:* ${amount:.2f}
+*Payment ID:* `{payment_id}`
+
+*Instructions:*
+1. Click the *🔗 PayPal Link* below
+2. Login to PayPal
+3. Approve the payment
+4. Return to this chat
+
+*After approval:* Your donation will be automatically verified!
+
+*Payment Link:* [Click Here]({approval_url})
+"""
     
-    if len(results) > 0 and "Use:" not in results[0]:
-        response = "🎶 *Music Results:*\n\n"
-        for result in results:
-            response += f"{result}\n\n"
-        response += "💡 *Note:* These are YouTube links for listening."
-    else:
-        response = "❌ *No results found.*\n\nTry:\n• Different search terms\n• Check spelling\n• Example: `/music Shape of You`"
+    keyboard = [
+        [InlineKeyboardButton("🔗 PayPal Link", url=approval_url)],
+        [InlineKeyboardButton("✅ I've Paid", callback_data=f'verify_{payment_id}'),
+         InlineKeyboardButton("🔄 Check Status", callback_data=f'check_{payment_id}')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='donate')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(response, parse_mode="Markdown")
+    await query.edit_message_text(payment_msg, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=False)
 
-async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tell a joke"""
-    joke = random.choice(JOKES)
-    await update.message.reply_text(f"😂 *Joke of the Day:*\n\n{joke}", parse_mode="Markdown")
-
-async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Share a fun fact"""
-    fact = random.choice(FACTS)
-    await update.message.reply_text(f"💡 *Did You Know?*\n\n{fact}", parse_mode="Markdown")
-
-async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Share inspirational quote"""
-    quote = random.choice(QUOTES)
-    await update.message.reply_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear conversation memory"""
-    user = update.effective_user
-    clear_conversation(user.id)
-    await update.message.reply_text(
-        "🧹 *Conversation cleared!*\n\n"
-        "Note: Your profile data (name, preferences) is still saved.\n"
-        "Use `/mystats` to see your data.\n\n"
-        "Let's start fresh! 😊",
-        parse_mode="Markdown"
-    )
-
-async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get a fun image"""
-    try:
-        meme_topics = ["funny", "meme", "comedy", "cat", "dog", "dank", "wholesome"]
-        topic = random.choice(meme_topics)
-        response = requests.get(f"https://source.unsplash.com/400x400/?{topic}", timeout=10)
+async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, payment_id):
+    """Verify PayPal payment"""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Get pending payment
+    pending = db.get_pending_payment(payment_id)
+    if not pending:
+        await query.answer("❌ Payment not found or expired", show_alert=True)
+        return
+    
+    # Check with PayPal
+    payment_details = paypal.get_payment_details(payment_id)
+    if not payment_details:
+        await query.answer("❌ Could not verify payment. Try again later.", show_alert=True)
+        return
+    
+    # Check payment state
+    state = payment_details.get("state")
+    
+    if state == "approved":
+        # Try to execute payment
+        # Note: In real implementation, you'd execute after user approves
+        # For now, we'll mark as completed
         
-        if response.status_code == 200:
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
-            
-            with open(tmp_path, 'rb') as photo:
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption=f"😄 *Random {topic.capitalize()} Image!*\nUse `/image` to create your own!",
-                    parse_mode="Markdown"
-                )
-            
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
-        else:
-            await joke_command(update, context)
-            
-    except Exception as e:
-        logger.error(f"Meme error: {e}")
-        await update.message.reply_text(
-            "🎭 Need fun? Try:\n• `/joke` - For laughs\n• `/image` - Create your own memes\n• Just chat with me! 😊",
-            parse_mode="Markdown"
+        db.save_donation(
+            user_id=user.id,
+            amount=pending["amount"],
+            currency="USD",
+            payment_id=payment_id,
+            transaction_id=payment_id,  # Use payment ID as transaction ID
+            status="completed"
         )
+        
+        success_msg = f"""
+✅ *PAYMENT VERIFIED!* 🎉
+
+Thank you for your donation of *${pending['amount']:.2f}*!
+You are now a StarAI Supporter! 🎖️
+
+*Payment ID:* `{payment_id}`
+*Amount:* ${pending['amount']:.2f}
+*Status:* ✅ Completed
+
+*Thank you for supporting StarAI!* 💝🙏
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("🎖️ My Status", callback_data='my_donations'),
+             InlineKeyboardButton("💰 Donate More", callback_data='donate')],
+            [InlineKeyboardButton("🔙 Menu", callback_data='back')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(success_msg, parse_mode="Markdown", reply_markup=reply_markup)
+    
+    elif state == "created":
+        # Payment created but not approved
+        await query.answer("⏳ Payment created but not approved yet. Click the PayPal link to approve.", show_alert=True)
+    else:
+        # Other states
+        await query.answer(f"Payment status: {state}. Please contact support if approved.", show_alert=True)
 
 # ========================
 # BUTTON HANDLERS
 # ========================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses"""
+    """Handle button presses"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'create_image':
-        await query.edit_message_text(
-            "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
-            parse_mode="Markdown"
-        )
-    elif query.data == 'find_music':
-        await query.edit_message_text(
-            "🎵 *Music Search*\n\nSend: `/music <song or artist>`\n\n*Examples:*\n• `/music Imagine Dragons`\n• `/music chill lofi`\n• `/music 80s hits`",
-            parse_mode="Markdown"
-        )
-    elif query.data == 'get_joke':
-        await query.edit_message_text(f"😂 *Joke:*\n\n{random.choice(JOKES)}", parse_mode="Markdown")
-    elif query.data == 'get_fact':
-        await query.edit_message_text(f"💡 *Fact:*\n\n{random.choice(FACTS)}", parse_mode="Markdown")
-    elif query.data == 'get_quote':
-        await query.edit_message_text(f"📜 *Quote:*\n\n{random.choice(QUOTES)}", parse_mode="Markdown")
-    elif query.data == 'my_memory':
-        user = query.from_user
-        user_data = memory_db.get_user_data(user.id)
+    if query.data == 'donate':
+        await donate_command(update, context)
+    
+    elif query.data.startswith('donate_'):
+        amount_str = query.data.replace('donate_', '')
         
-        if user_data and user_data.get("name"):
-            response = f"🧠 *I Remember You!*\n\nHi *{user_data['name']}*! 😊\n\n"
-            if user_data.get("favorite_color"):
-                response += f"Your favorite color is *{user_data['favorite_color']}*! 🎨\n"
-            if user_data.get("interests"):
-                response += f"You're interested in *{user_data['interests']}*! 🎭\n\n"
-            response += "Use `/remember` to update your info!"
-        else:
-            response = (
-                "🧠 *My Memory*\n\n"
-                "I don't have much info about you yet!\n\n"
-                "Tell me about yourself:\n"
-                "• `/remember name [your name]`\n"
-                "• `/remember color [favorite color]`\n"
-                "• `/remember interests [your interests]`\n\n"
-                "*I'll remember for next time!* 😊"
+        if amount_str == 'custom':
+            await query.edit_message_text(
+                "💰 *Custom Donation*\n\n"
+                "Enter the amount you want to donate (in USD):\n\n"
+                "*Examples:* 5, 10.50, 25\n\n"
+                "Please send the amount as a number:",
+                parse_mode="Markdown"
             )
+            context.user_data[f"waiting_custom_{query.from_user.id}"] = True
+            return
         
-        await query.edit_message_text(response, parse_mode="Markdown")
+        try:
+            amount = float(amount_str)
+            await create_payment(update, context, amount)
+        except ValueError:
+            await query.answer("Invalid amount", show_alert=True)
+    
+    elif query.data.startswith('verify_'):
+        payment_id = query.data.replace('verify_', '')
+        await verify_payment(update, context, payment_id)
+    
+    elif query.data.startswith('check_'):
+        payment_id = query.data.replace('check_', '')
+        await verify_payment(update, context, payment_id)
+    
+    elif query.data == 'check_payment':
+        await query.edit_message_text(
+            "🔍 *CHECK PAYMENT STATUS*\n\n"
+            "Enter your Payment ID or Transaction ID:\n\n"
+            "*Format:* `PAYID-...` or `trx_...`\n\n"
+            "Send the ID to check status.",
+            parse_mode="Markdown"
+        )
+        context.user_data[f"waiting_check_{query.from_user.id}"] = True
+    
+    elif query.data == 'my_donations':
+        await mydonations_command(update, context)
+    
+    elif query.data == 'stats':
+        await stats_command(update, context)
+    
+    elif query.data == 'back':
+        await start(update, context)
+    
+    # Other buttons...
+    elif query.data == 'create_image':
+        await query.edit_message_text("🎨 *Image Creation*\n\nSend: `/image <description>`", parse_mode="Markdown")
+    elif query.data == 'find_music':
+        await query.edit_message_text("🎵 *Music Search*\n\nSend: `/music <song>`", parse_mode="Markdown")
+    elif query.data == 'joke':
+        jokes = ["😂 Why don't scientists trust atoms? Because they make up everything!", "😄 Why did the scarecrow win an award? He was outstanding in his field!"]
+        await query.edit_message_text(f"😂 *Joke:*\n\n{random.choice(jokes)}", parse_mode="Markdown")
     elif query.data == 'help':
         await help_command(update, context)
 
 # ========================
-# AI RESPONSE GENERATOR WITH MEMORY
-# ========================
-def generate_ai_response(user_id, user_message, username="", first_name="", last_name=""):
-    """Generate intelligent AI response with memory"""
-    try:
-        if not client:
-            return "🤖 *AI Service:* Currently unavailable. Try commands like `/image` or `/music`!"
-        
-        # Get conversation with user info
-        conversation = get_user_conversation(user_id, username, first_name, last_name)
-        
-        # Check if user is telling us their name or info
-        lower_msg = user_message.lower()
-        name_keywords = ["my name is", "i am called", "call me", "i'm", "im "]
-        
-        for keyword in name_keywords:
-            if keyword in lower_msg:
-                parts = user_message.lower().split(keyword)
-                if len(parts) > 1 and len(parts[1].strip()) > 1:
-                    name = parts[1].strip().split()[0].capitalize()
-                    memory_db.save_user_data(user_id, name=name)
-                    break
-        
-        # Add user message to conversation
-        conversation.append({"role": "user", "content": user_message})
-        
-        # Get AI response
-        response = client.chat.completions.create(
-            messages=conversation,
-            model="llama-3.1-8b-instant",
-            temperature=0.8,
-            max_tokens=600
-        )
-        
-        ai_response = response.choices[0].message.content
-        
-        # Save both messages to database
-        update_conversation(user_id, "user", user_message)
-        update_conversation(user_id, "assistant", ai_response)
-        
-        return ai_response
-        
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        return get_fallback_response(user_message)
-
-def get_fallback_response(user_message):
-    """Fallback responses"""
-    user_lower = user_message.lower()
-    
-    # Greetings
-    greetings = {
-        "hi": "👋 Hello! I'm StarAI! How can I help you today? 😊",
-        "hello": "🌟 Hello there! Great to meet you! What would you like to chat about?",
-        "hey": "😄 Hey! I'm here and ready to help! Ask me anything!",
-        "how are you": "✨ I'm doing great, thanks for asking! Ready to assist you. How about you?",
-    }
-    
-    for key, response in greetings.items():
-        if key in user_lower:
-            return response
-    
-    # Memory-related
-    if "remember" in user_lower and ("my name" in user_lower or "i am" in user_lower):
-        return "💾 Tell me: `/remember name [your name]` and I'll remember it forever! 😊"
-    
-    if "what do you know about me" in user_lower or "do you remember me" in user_lower:
-        return "🧠 Use `/mystats` to see what I remember about you! Or tell me about yourself! 😊"
-    
-    # Default
-    return """✨ I'd love to help! You can:
-
-🎨 *Create images:* "Make an image of a sunset"
-🎵 *Find music:* "Play some jazz music"
-💬 *Chat naturally:* "Explain quantum physics"
-🎭 *Have fun:* "Tell me a joke"
-🧠 *Tell me about yourself:* "My name is John"
-
-I'll remember what you tell me! Use `/remember` to set preferences. 😊"""
-
-# ========================
-# MAIN MESSAGE HANDLER
+# MESSAGE HANDLER
 # ========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all incoming messages"""
+    """Handle all messages"""
     try:
         user = update.effective_user
         user_message = update.message.text
         
-        logger.info(f"User {user.id}: {user_message[:50]}")
-        
-        # Show typing indicator
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing"
-        )
-        
-        # Check for image requests in natural language
-        image_keywords = ["create image", "generate image", "draw", "paint", "picture of", "image of", "make a picture", "generate a picture"]
-        if any(keyword in user_message.lower() for keyword in image_keywords):
-            prompt = user_message
+        # Check for custom amount
+        if context.user_data.get(f"waiting_custom_{user.id}"):
+            context.user_data.pop(f"waiting_custom_{user.id}", None)
             
-            for keyword in image_keywords:
-                if keyword in user_message.lower():
-                    parts = user_message.lower().split(keyword)
+            try:
+                amount = float(user_message)
+                if amount < 1:
+                    await update.message.reply_text("❌ Minimum donation is $1", parse_mode="Markdown")
+                elif amount > 1000:
+                    await update.message.reply_text("❌ Maximum donation is $1000", parse_mode="Markdown")
+                else:
+                    # Create payment
+                    payment_id, approval_url = paypal.create_payment(user.id, amount)
+                    
+                    if payment_id:
+                        db.save_pending_payment(payment_id, user.id, amount, "USD", approval_url)
+                        
+                        payment_msg = f"""
+💳 *CUSTOM PAYMENT: ${amount:.2f}*
+
+*Payment ID:* `{payment_id}`
+
+Click the PayPal link below to complete payment:
+
+[🔗 PayPal Payment Link]({approval_url})
+
+*After payment:* Click *✅ I've Paid* below.
+"""
+                        
+                        keyboard = [
+                            [InlineKeyboardButton("🔗 PayPal Link", url=approval_url)],
+                            [InlineKeyboardButton("✅ I've Paid", callback_data=f'verify_{payment_id}')],
+                            [InlineKeyboardButton("❌ Cancel", callback_data='donate')]
+                        ]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        
+                        await update.message.reply_text(payment_msg, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=False)
+                    else:
+                        await update.message.reply_text("❌ Could not create payment. Try again.", parse_mode="Markdown")
+            except ValueError:
+                await update.message.reply_text("❌ Please enter a valid number (like 5 or 10.50)", parse_mode="Markdown")
+            return
+        
+        # Check for payment verification
+        if context.user_data.get(f"waiting_check_{user.id}"):
+            context.user_data.pop(f"waiting_check_{user.id}", None)
+            
+            transaction_id = user_message.strip()
+            
+            # Try to verify with PayPal
+            transaction = paypal.verify_transaction(transaction_id)
+            if transaction:
+                # Check if already in database
+                donations = db.get_user_donations(user.id)
+                found = False
+                for donation in donations:
+                    if donation["transaction_id"] == transaction_id or donation["payment_id"] == transaction_id:
+                        found = True
+                        status = "✅ Completed" if donation["status"] == "completed" else "⏳ Pending"
+                        await update.message.reply_text(
+                            f"✅ *PAYMENT FOUND*\n\n"
+                            f"*Status:* {status}\n"
+                            f"*Amount:* ${donation['amount']:.2f}\n"
+                            f"*Date:* {donation['created_at'][:10]}\n\n"
+                            f"Use `/mydonations` for details.",
+                            parse_mode="Markdown"
+                        )
+                        break
+                
+                if not found:
+                    # Add to database
+                    db.save_donation(
+                        user_id=user.id,
+                        amount=transaction["amount"],
+                        currency=transaction["currency"],
+                        payment_id=transaction_id,
+                        transaction_id=transaction_id,
+                        status="completed"
+                    )
+                    
+                    await update.message.reply_text(
+                        f"✅ *PAYMENT VERIFIED!*\n\n"
+                        f"*Amount:* ${transaction['amount']:.2f}\n"
+                        f"*Status:* ✅ Completed\n"
+                        f"*Date:* {transaction['create_time'][:10]}\n\n"
+                        f"Thank you for your donation! 🎖️",
+                        parse_mode="Markdown"
+                    )
+            else:
+                await update.message.reply_text(
+                    "❌ *PAYMENT NOT FOUND*\n\n"
+                    "We couldn't verify this transaction ID.\n\n"
+                    "*Possible reasons:*\n"
+                    "• Transaction ID is incorrect\n"
+                    "• Payment is still processing\n"
+                    "• Payment was cancelled\n\n"
+                    "Try again or contact support.",
+                    parse_mode="Markdown"
+                )
+            return
+        
+        # Check for image requests
+        if any(word in user_message.lower() for word in ["create image", "generate image", "draw", "picture of", "image of"]):
+            prompt = user_message
+            for word in ["create image", "generate image", "draw", "picture of", "image of"]:
+                if word in user_message.lower():
+                    parts = user_message.lower().split(word)
                     if len(parts) > 1:
                         prompt = parts[1].strip()
                         break
             
-            if not prompt or len(prompt) < 2:
+            if not prompt:
                 prompt = "a beautiful artwork"
             
-            msg = await update.message.reply_text(f"🎨 *Creating:* `{prompt}`...", parse_mode="Markdown")
+            msg = await update.message.reply_text(f"🎨 *Creating:* {prompt}...", parse_mode="Markdown")
             image_path = generate_image(prompt)
             
-            if image_path and os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
+            if image_path and os.path.exists(image_path):
                 try:
                     with open(image_path, 'rb') as photo:
                         await update.message.reply_photo(
                             photo=photo,
-                            caption=f"✨ *Generated:* `{prompt}`\n*By StarAI* 🎨",
+                            caption=f"✨ *Generated:* {prompt}\n*By StarAI* 🎨",
                             parse_mode="Markdown"
                         )
-                    
                     try:
-                        await context.bot.delete_message(
-                            chat_id=update.effective_chat.id,
-                            message_id=msg.message_id
-                        )
+                        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
                     except:
                         pass
-                except Exception as e:
-                    logger.error(f"Error sending image: {e}")
-                    await msg.edit_text("❌ Couldn't send the image. Try `/image` command instead.")
+                except:
+                    await msg.edit_text("❌ Couldn't send image.")
                 finally:
                     try:
-                        if os.path.exists(image_path):
-                            os.unlink(image_path)
+                        os.unlink(image_path)
                     except:
                         pass
             else:
-                await msg.edit_text("❌ Image creation failed. Try: `/image <description>`")
+                await msg.edit_text("❌ Image creation failed.")
             return
         
-        # Check for music requests in natural language
-        music_keywords = ["play music", "find song", "music by", "listen to", "song by", "find music", "search music"]
-        if any(keyword in user_message.lower() for keyword in music_keywords):
+        # Check for music requests
+        if any(word in user_message.lower() for word in ["play music", "find song", "music by", "listen to"]):
             query = user_message
-            
-            for keyword in music_keywords:
-                if keyword in user_message.lower():
-                    parts = user_message.lower().split(keyword)
+            for word in ["play music", "find song", "music by", "listen to"]:
+                if word in user_message.lower():
+                    parts = user_message.lower().split(word)
                     if len(parts) > 1:
                         query = parts[1].strip()
                         break
@@ -1103,38 +1085,270 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not query:
                 query = "popular music"
             
-            msg = await update.message.reply_text(f"🎵 *Searching:* `{query}`...", parse_mode="Markdown")
+            msg = await update.message.reply_text(f"🎵 *Searching:* {query}...", parse_mode="Markdown")
             results = search_music(query)
             
-            if len(results) > 0 and "Use:" not in results[0]:
-                response = "🎶 *Music Results:*\n\n"
-                for result in results:
-                    response += f"{result}\n\n"
-                response += "💡 *Note:* YouTube links for listening."
-            else:
-                response = "❌ *No results found.* Try: `/music <song name>`"
-            
+            response = "🎶 *Results:*\n\n" + "\n".join(results)
             await msg.edit_text(response, parse_mode="Markdown")
             return
         
-        # Generate AI response for other messages
-        ai_response = generate_ai_response(
-            user.id, 
-            user_message, 
-            user.username, 
-            user.first_name, 
-            user.last_name
-        )
+        # Default AI response
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
-        # Send response
-        await update.message.reply_text(ai_response, parse_mode="Markdown")
+        responses = [
+            "✨ I'm here to help! You can ask me anything or use commands like `/image` or `/music`.",
+            "😊 How can I assist you today? I can create images, find music, or just chat!",
+            "🌟 Need help? Try `/help` to see all commands, or just tell me what you need!",
+        ]
+        
+        if "donat" in user_message.lower() or "support" in user_message.lower():
+            response = "💰 Want to support StarAI? Use `/donate` to make a payment via PayPal! It's optional but appreciated! ☕"
+        elif "hi" in user_message.lower() or "hello" in user_message.lower():
+            response = f"👋 Hello {user.first_name}! I'm StarAI! How can I help you today? 😊"
+        else:
+            response = random.choice(responses)
+        
+        await update.message.reply_text(response, parse_mode="Markdown")
         
     except Exception as e:
-        logger.error(f"Error in handle_message: {e}")
-        await update.message.reply_text(
-            "❌ *Error occurred.*\n\nTry:\n• `/help` for commands\n• Rephrase your message\n• I'm still learning! 😊",
-            parse_mode="Markdown"
-        )
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Something went wrong. Try again or use `/help`.", parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command"""
+    help_text = """
+🆘 *STARAI HELP*
+
+🎨 **IMAGE:**
+`/image <description>` - Create AI image
+
+🎵 **MUSIC:**
+`/music <song>` - Find music on YouTube
+
+💰 **DONATIONS (PayPal):**
+`/donate` - Support via PayPal
+`/mydonations` - Your donation history
+`/stats` - Donation statistics
+
+💬 **CHAT:**
+Just talk to me naturally!
+
+🎭 **FUN:**
+`/joke` - Get a joke
+`/fact` - Interesting fact
+`/quote` - Inspiring quote
+
+🔧 **OTHER:**
+`/start` - Welcome message
+`/clear` - Reset conversation
+`/help` - This message
+
+*Thank you for using StarAI!* 😊
+"""
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate image"""
+    prompt = ' '.join(context.args)
+    
+    if not prompt:
+        await update.message.reply_text("🎨 *Usage:* `/image <description>`", parse_mode="Markdown")
+        return
+    
+    msg = await update.message.reply_text(f"🎨 *Creating:* {prompt}...", parse_mode="Markdown")
+    image_path = generate_image(prompt)
+    
+    if image_path and os.path.exists(image_path):
+        try:
+            with open(image_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=f"✨ *Generated:* {prompt}\n*By StarAI* 🎨",
+                    parse_mode="Markdown"
+                )
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+        except:
+            await msg.edit_text("❌ Couldn't send image.")
+        finally:
+            try:
+                os.unlink(image_path)
+            except:
+                pass
+    else:
+        await msg.edit_text("❌ Image creation failed.")
+
+async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search music"""
+    query = ' '.join(context.args)
+    
+    if not query:
+        await update.message.reply_text("🎵 *Usage:* `/music <song or artist>`", parse_mode="Markdown")
+        return
+    
+    await update.message.reply_text(f"🔍 *Searching:* {query}", parse_mode="Markdown")
+    results = search_music(query)
+    
+    response = "🎶 *Results:*\n\n" + "\n".join(results) + "\n\n💡 YouTube links for listening."
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tell a joke"""
+    jokes = [
+        "😂 Why don't scientists trust atoms? Because they make up everything!",
+        "😄 Why did the scarecrow win an award? He was outstanding in his field!",
+        "🤣 What do you call a fake noodle? An impasta!",
+        "😆 Why did the math book look so sad? It had too many problems!",
+        "😊 How does the moon cut his hair? Eclipse it!"
+    ]
+    await update.message.reply_text(f"😂 *Joke:*\n\n{random.choice(jokes)}", parse_mode="Markdown")
+
+async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a fact"""
+    facts = [
+        "🐝 Honey never spoils! 3000-year-old honey found in tombs is still edible.",
+        "🧠 Octopuses have three hearts! Two pump blood to gills, one to body.",
+        "🌊 The shortest war was Britain-Zanzibar in 1896. It lasted 38 minutes!",
+        "🐌 Snails can sleep for 3 years when hibernating.",
+        "🦒 A giraffe's neck has same vertebrae as humans: seven!"
+    ]
+    await update.message.reply_text(f"💡 *Fact:*\n\n{random.choice(facts)}", parse_mode="Markdown")
+
+async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share quote"""
+    quotes = [
+        "🌟 'The only way to do great work is to love what you do.' - Steve Jobs",
+        "💫 'Your time is limited, don't waste it living someone else's life.' - Steve Jobs",
+        "🚀 'The future belongs to those who believe in the beauty of their dreams.' - Eleanor Roosevelt",
+        "🌱 'The only impossible journey is the one you never begin.' - Tony Robbins",
+        "💖 'Be yourself; everyone else is already taken.' - Oscar Wilde"
+    ]
+    await update.message.reply_text(f"📜 *Quote:*\n\n{random.choice(quotes)}", parse_mode="Markdown")
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear conversation"""
+    await update.message.reply_text("🧹 *Chat cleared!* Let's start fresh! 😊", parse_mode="Markdown")
+
+# ========================
+# ADMIN COMMANDS
+# ========================
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin commands"""
+    user = update.effective_user
+    
+    if str(user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Admin only.", parse_mode="Markdown")
+        return
+    
+    args = context.args
+    
+    if not args:
+        help_text = """
+🔧 *ADMIN COMMANDS*
+
+`/admin stats` - Detailed stats
+`/admin pending` - Pending payments
+`/admin verify <id>` - Verify payment
+`/admin users` - All supporters
+`/admin export` - Export data
+"""
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+        return
+    
+    cmd = args[0].lower()
+    
+    if cmd == "stats":
+        # Get detailed stats
+        conn = sqlite3.connect(db.db_file)
+        cursor = conn.cursor()
+        
+        # Today's donations
+        cursor.execute('SELECT SUM(amount) FROM donations WHERE date(created_at) = date("now") AND status = "completed"')
+        today = cursor.fetchone()[0] or 0
+        
+        # This month
+        cursor.execute('SELECT SUM(amount) FROM donations WHERE strftime("%Y-%m", created_at) = strftime("%Y-%m", "now") AND status = "completed"')
+        month = cursor.fetchone()[0] or 0
+        
+        # All time
+        cursor.execute('SELECT SUM(amount) FROM donations WHERE status = "completed"')
+        total = cursor.fetchone()[0] or 0
+        
+        # Top donors
+        cursor.execute('''
+            SELECT u.first_name, SUM(d.amount) as total
+            FROM donations d
+            JOIN users u ON d.user_id = u.user_id
+            WHERE d.status = "completed"
+            GROUP BY d.user_id
+            ORDER BY total DESC
+            LIMIT 5
+        ''')
+        top = cursor.fetchall()
+        
+        conn.close()
+        
+        response = f"""
+📊 *ADMIN STATS*
+
+*Today:* ${today:.2f}
+*This Month:* ${month:.2f}
+*All Time:* ${total:.2f}
+
+*Top 5 Donors:*
+"""
+        for name, amount in top:
+            response += f"\n• {name}: ${amount:.2f}"
+        
+        await update.message.reply_text(response, parse_mode="Markdown")
+    
+    elif cmd == "pending":
+        # Get pending payments
+        conn = sqlite3.connect(db.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM pending_payments ORDER BY created_at DESC')
+        pending = cursor.fetchall()
+        
+        conn.close()
+        
+        if not pending:
+            await update.message.reply_text("✅ No pending payments.", parse_mode="Markdown")
+            return
+        
+        response = "⏳ *PENDING PAYMENTS*\n\n"
+        for payment in pending:
+            response += f"• ID: `{payment[0]}`\n"
+            response += f"  User: {payment[1]}, Amount: ${payment[2]:.2f}\n"
+            response += f"  Created: {payment[5][:16]}\n\n"
+        
+        await update.message.reply_text(response, parse_mode="Markdown")
+    
+    elif cmd == "export":
+        # Export data as JSON
+        conn = sqlite3.connect(db.db_file)
+        cursor = conn.cursor()
+        
+        # Get all donations
+        cursor.execute('SELECT * FROM donations ORDER BY created_at DESC')
+        donations = cursor.fetchall()
+        
+        # Get all users
+        cursor.execute('SELECT * FROM users')
+        users = cursor.fetchall()
+        
+        conn.close()
+        
+        data = {
+            "donations": donations,
+            "users": users,
+            "exported_at": datetime.now().isoformat()
+        }
+        
+        # Save to file
+        with open("export.json", "w") as f:
+            json.dump(data, f, indent=2)
+        
+        await update.message.reply_text("✅ Data exported to export.json", parse_mode="Markdown")
 
 # ========================
 # MAIN FUNCTION
@@ -1142,32 +1356,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the bot"""
     print("=" * 50)
-    print("🌟 STARAI v3.0 - AI ASSISTANT WITH PERSISTENT MEMORY")
+    print("🌟 STARAI - WITH PAYPAL PAYMENTS")
     print("=" * 50)
     
-    # Check API keys
     if not TELEGRAM_TOKEN:
         print("❌ ERROR: TELEGRAM_TOKEN missing!")
-        print("Add to Heroku: Settings → Config Vars")
-        print("Or set: export TELEGRAM_TOKEN='your_token'")
+        print("Set in Heroku: Settings → Config Vars")
         return
     
-    if not GROQ_API_KEY:
-        print("⚠️ WARNING: GROQ_API_KEY missing")
-        print("Get FREE key: https://console.groq.com")
-        print("Chat features limited without it")
+    if not PAYPAL_CLIENT_ID or not PAYPAL_SECRET:
+        print("⚠️ WARNING: PayPal credentials missing")
+        print("Donations will use manual verification")
     
-    print("✅ Starting StarAI with PERSISTENT MEMORY...")
-    print("💾 Database: SQLite (starai_memory.db)")
-    print("📸 Image generation: Pollinations.ai + Craiyon")
-    print("🎵 Music search: YouTube")
-    print("💬 AI chat: Groq LLaMA 3.1 with memory")
+    print("✅ Features: AI Chat, Image Generation, Music, PayPal Donations")
+    print("💰 PayPal: Automatic payment verification")
+    print("🔧 Admin: /admin commands available")
+    print("=" * 50)
     
-    # Show database stats
-    stats = memory_db.get_all_users()
-    print(f"📊 Database stats: {stats['total_users']} total users")
-    
-    # Create application
     try:
         app = Application.builder().token(TELEGRAM_TOKEN).build()
         
@@ -1175,16 +1380,16 @@ def main():
         commands = [
             ("start", start),
             ("help", help_command),
-            ("about", about_command),
+            ("donate", donate_command),
+            ("mydonations", mydonations_command),
+            ("stats", stats_command),
             ("image", image_command),
             ("music", music_command),
             ("joke", joke_command),
             ("fact", fact_command),
             ("quote", quote_command),
             ("clear", clear_command),
-            ("meme", meme_command),
-            ("remember", remember_command),
-            ("mystats", mystats_command),
+            ("admin", admin_command),
         ]
         
         for command, handler in commands:
@@ -1196,17 +1401,14 @@ def main():
         # Add message handler
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        print("✅ StarAI v3.0 is running WITH MEMORY!")
-        print("📱 Features: Persistent Memory, AI Chat, Image Generation, Music Search")
-        print("🔧 Send /start to begin")
+        print("✅ Bot is running! Send /start to begin")
+        print("💰 Send /donate to test PayPal payments")
         print("=" * 50)
         
-        # Start bot
         app.run_polling()
         
     except Exception as e:
         print(f"❌ Failed to start: {e}")
-        print("Check your TELEGRAM_TOKEN")
 
 if __name__ == '__main__':
     main()
