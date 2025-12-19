@@ -429,7 +429,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """NEW: Beautiful donation interface like screenshot"""
+    """Beautiful donation interface with amount buttons"""
     user = update.effective_user
     stats = donation_db.get_stats()
     user_total = donation_db.get_user_total(user.id)
@@ -457,7 +457,7 @@ Running StarAI costs money for:
 *Choose amount:*
 """
     
-    # Donation amount buttons (like screenshot)
+    # Donation amount buttons
     keyboard = [
         [InlineKeyboardButton("☕ Tea - $3", callback_data='donate_3'),
          InlineKeyboardButton("☕ Coffee - $5", callback_data='donate_5')],
@@ -471,7 +471,6 @@ Running StarAI costs money for:
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Edit message if called from button, otherwise send new
     if update.callback_query:
         await update.callback_query.edit_message_text(donate_text, parse_mode="Markdown", reply_markup=reply_markup)
     else:
@@ -635,68 +634,41 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 # ========================
-# AI RESPONSE GENERATOR
+# PAYMENT SELECTION FUNCTION
 # ========================
-def generate_ai_response(user_id, user_message):
-    try:
-        if not client:
-            return """🤖 *AI Chat Currently Unavailable*
-
-I can still help you with:
-🎨 `/image <description>` - Create images
-🎵 `/music <song>` - Find music
-😂 `/joke` - Get a laugh
-💡 `/fact` - Learn something new
-💰 `/donate` - Support this bot
-
-*Get AI Chat:* Add `GROQ_API_KEY` to Heroku Config Vars"""
-        
-        conversation = get_user_conversation(user_id)
-        conversation.append({"role": "user", "content": user_message})
-        
-        response = client.chat.completions.create(
-            messages=conversation,
-            model="llama-3.1-8b-instant",
-            temperature=0.8,
-            max_tokens=600
-        )
-        
-        ai_response = response.choices[0].message.content
-        update_conversation(user_id, "assistant", ai_response)
-        return ai_response
-        
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        return get_fallback_response(user_message)
-
-def get_fallback_response(user_message):
-    user_lower = user_message.lower()
+async def show_payment_options(update: Update, context: ContextTypes.DEFAULT_TYPE, amount):
+    """Show payment buttons after amount selection"""
+    query = update.callback_query
     
-    greetings = {
-        "hi": "👋 Hello! I'm StarAI! How can I help you today? 😊",
-        "hello": "🌟 Hello there! Great to meet you! What would you like to chat about?",
-        "hey": "😄 Hey! I'm here and ready to help! Ask me anything!",
-        "how are you": "✨ I'm doing great, thanks for asking! Ready to assist you. How about you?",
-    }
+    # Store the selected amount
+    context.user_data[f"selected_amount_{query.from_user.id}"] = amount
     
-    for key, response in greetings.items():
-        if key in user_lower:
-            return response
-    
-    if "your name" in user_lower:
-        return "🤖 I'm StarAI! Your friendly AI companion! 😊"
-    
-    return """✨ I'd love to help! You can:
+    # Create payment message with buttons
+    payment_text = f"""
+✅ *Selected: ${amount}*
 
-🎨 *Create images:* `/image sunset over mountains`
-🎵 *Find music:* `/music Taylor Swift`
-💬 *Chat naturally:* Just talk to me!
-🎭 *Have fun:* `/joke`, `/fact`, `/quote`
+Now choose your payment method:
 
-*Need help?* Try `/help` for all commands! 😊"""
+1. **PayPal** - Secure payment with card or PayPal balance
+2. **Buy Me Coffee** - Simple one-click donation
+
+*After payment, click "✅ I've Paid" below and send your Transaction ID.*
+"""
+    
+    # Payment buttons (URL buttons that open in browser)
+    keyboard = [
+        [InlineKeyboardButton("💳 PayPal Payment", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+         InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
+        [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
+         InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(payment_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ========================
-# BUTTON HANDLERS (UPDATED WITH NEW DONATION INTERFACE)
+# BUTTON HANDLERS (UPDATED WITH PAYMENT BUTTONS)
 # ========================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -704,6 +676,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Button pressed: {query.data}")
     
+    # Image and Music buttons
     if query.data == 'create_image':
         await query.edit_message_text(
             "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
@@ -724,7 +697,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quote = random.choice(QUOTES)
         await query.edit_message_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
     
-    # NEW DONATION BUTTONS
+    # Donation amount selection buttons
     elif query.data.startswith('donate_'):
         if query.data == 'donate_custom':
             context.user_data[f"waiting_custom_{query.from_user.id}"] = True
@@ -740,47 +713,58 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             # Extract amount from button (donate_3, donate_5, etc.)
-            amount = query.data.split('_')[1]
-            if amount.isdigit():
-                context.user_data[f"selected_amount_{query.from_user.id}"] = int(amount)
-                await query.edit_message_text(
-                    f"✅ *Selected: ${amount}*\n\n"
-                    "Please send your **Transaction ID** after payment:\n\n"
-                    "1. Donate via:\n"
-                    "   • PayPal: https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8\n"
-                    "   • Buy Me Coffee: https://www.buymeacoffee.com/StarAI\n\n"
-                    "2. Then click *✅ Check Payment* button\n\n"
-                    "*Thank you for supporting StarAI!* 💝",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Check Payment", callback_data='i_donated')],
-                        [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
-                    ])
-                )
+            amount = int(query.data.split('_')[1])
+            await show_payment_options(update, context, amount)
     
+    # Donation menu button
     elif query.data == 'donate':
         await donate_command(update, context)
     
+    # Payment confirmation button
     elif query.data == 'i_donated':
         user = query.from_user
+        
+        # Check if amount is selected
+        selected_amount = context.user_data.get(f"selected_amount_{user.id}", 0)
+        
+        if selected_amount == 0:
+            # No amount selected, ask to choose first
+            await query.edit_message_text(
+                "❌ *No Amount Selected*\n\n"
+                "Please select a donation amount first!\n\n"
+                "Click 🔙 Back to choose an amount.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
+                ])
+            )
+            return
+        
         context.user_data[f"waiting_proof_{user.id}"] = True
         
         await query.edit_message_text(
-            "✅ *PAYMENT CONFIRMATION*\n\n"
+            f"✅ *PAYMENT CONFIRMATION*\n\n"
+            f"*Selected Amount:* ${selected_amount:.2f}\n\n"
             "Please send your **Transaction ID** or **Payment Reference**:\n\n"
             "*Format:* `TXID123456789` or `BMC-ABC123`\n\n"
+            "*How to find:*\n"
+            "• PayPal: Check email or transaction details\n"
+            "• Buy Me Coffee: Check supporter list\n\n"
             "Or send a screenshot of your payment confirmation.\n\n"
             "*Note:* Verification may take some time.\n"
             "Thank you! 🙏",
             parse_mode="Markdown"
         )
     
+    # My Donations button
     elif query.data == 'my_donations':
         await mydonations_command(update, context)
     
+    # Back to menu button
     elif query.data == 'back_to_menu':
         await start(update, context)
     
+    # Chat button
     elif query.data == 'chat':
         await query.edit_message_text(
             "💬 *Let's Chat!*\n\n"
@@ -789,6 +773,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     
+    # Help button
     elif query.data == 'help':
         await query.edit_message_text(
             "🆘 *STARAI HELP CENTER*\n\n"
@@ -838,23 +823,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try:
                 amount = float(user_message)
+                if amount < 1:
+                    await update.message.reply_text("❌ Minimum donation is $1. Please enter a valid amount.")
+                    return
+                
+                # Show payment options for custom amount
+                payment_text = f"""
+✅ *Selected: ${amount:.2f}*
+
+Now choose your payment method:
+
+1. **PayPal** - Secure payment with card or PayPal balance
+2. **Buy Me Coffee** - Simple one-click donation
+
+*After payment, click "✅ I've Paid" below and send your Transaction ID.*
+"""
+                
+                # Store the selected amount
                 context.user_data[f"selected_amount_{user.id}"] = amount
                 
-                await update.message.reply_text(
-                    f"✅ *Selected: ${amount:.2f}*\n\n"
-                    "Please send your **Transaction ID** after payment:\n\n"
-                    "1. Donate via:\n"
-                    "   • PayPal: https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8\n"
-                    "   • Buy Me Coffee: https://www.buymeacoffee.com/StarAI\n\n"
-                    "2. Then click *✅ Check Payment* button\n\n"
-                    "*Thank you for supporting StarAI!* 💝",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Check Payment", callback_data='i_donated')],
-                        [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
-                    ])
-                )
+                # Payment buttons
+                keyboard = [
+                    [InlineKeyboardButton("💳 PayPal Payment", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+                     InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
+                    [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
+                     InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.message.reply_text(payment_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
                 return
+                
             except ValueError:
                 await update.message.reply_text("❌ Invalid amount. Please enter a number (like 5 or 10.50).")
                 return
@@ -863,14 +863,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get(f"waiting_proof_{user.id}"):
             context.user_data.pop(f"waiting_proof_{user.id}", None)
             
-            transaction_id = user_message
-            if user_message.lower().startswith("transaction:") or "txid" in user_message.lower():
+            transaction_id = user_message.strip()
+            
+            # Clean up transaction ID
+            if user_message.lower().startswith("transaction:"):
                 if ":" in user_message:
-                    transaction_id = user_message.split(":")[1].strip()
+                    transaction_id = user_message.split(":", 1)[1].strip()
+            elif "txid" in user_message.lower():
+                # Try to extract TX ID
+                import re
+                txid_match = re.search(r'(txid|transaction[ _-]?id)[: _-]?\s*([a-zA-Z0-9\-]+)', user_message, re.IGNORECASE)
+                if txid_match:
+                    transaction_id = txid_match.group(2).strip()
             
             # Get selected amount
             amount = context.user_data.get(f"selected_amount_{user.id}", 0)
+            
             if amount == 0:
+                # Ask for amount
+                context.user_data[f"waiting_amount_{user.id}"] = transaction_id
                 await update.message.reply_text(
                     "💰 *DONATION AMOUNT*\n\n"
                     "How much did you donate? (in USD)\n\n"
@@ -881,7 +892,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Please enter the amount:",
                     parse_mode="Markdown"
                 )
-                context.user_data[f"waiting_amount_{user.id}"] = transaction_id
                 return
             
             # Save donation
@@ -922,7 +932,7 @@ Use `/mydonations` to check your status.
             await update.message.reply_text(response, parse_mode="Markdown")
             return
         
-        # Check for amount input
+        # Check for amount input (if transaction ID was sent first)
         if context.user_data.get(f"waiting_amount_{user.id}"):
             transaction_id = context.user_data.pop(f"waiting_amount_{user.id}")
             
@@ -1053,6 +1063,67 @@ Use `/mydonations` to check your status.
         )
 
 # ========================
+# AI RESPONSE GENERATOR
+# ========================
+def generate_ai_response(user_id, user_message):
+    try:
+        if not client:
+            return """🤖 *AI Chat Currently Unavailable*
+
+I can still help you with:
+🎨 `/image <description>` - Create images
+🎵 `/music <song>` - Find music
+😂 `/joke` - Get a laugh
+💡 `/fact` - Learn something new
+💰 `/donate` - Support this bot
+
+*Get AI Chat:* Add `GROQ_API_KEY` to Heroku Config Vars"""
+        
+        conversation = get_user_conversation(user_id)
+        conversation.append({"role": "user", "content": user_message})
+        
+        response = client.chat.completions.create(
+            messages=conversation,
+            model="llama-3.1-8b-instant",
+            temperature=0.8,
+            max_tokens=600
+        )
+        
+        ai_response = response.choices[0].message.content
+        update_conversation(user_id, "assistant", ai_response)
+        return ai_response
+        
+    except Exception as e:
+        logger.error(f"AI error: {e}")
+        return get_fallback_response(user_message)
+
+def get_fallback_response(user_message):
+    user_lower = user_message.lower()
+    
+    greetings = {
+        "hi": "👋 Hello! I'm StarAI! How can I help you today? 😊",
+        "hello": "🌟 Hello there! Great to meet you! What would you like to chat about?",
+        "hey": "😄 Hey! I'm here and ready to help! Ask me anything!",
+        "how are you": "✨ I'm doing great, thanks for asking! Ready to assist you. How about you?",
+    }
+    
+    for key, response in greetings.items():
+        if key in user_lower:
+            return response
+    
+    if "your name" in user_lower:
+        return "🤖 I'm StarAI! Your friendly AI companion! 😊"
+    
+    return """✨ I'd love to help! You can:
+
+🎨 *Create images:* `/image sunset over mountains`
+🎵 *Find music:* `/music Taylor Swift`
+💬 *Chat naturally:* Just talk to me!
+🎭 *Have fun:* `/joke`, `/fact`, `/quote`
+
+*Need help?* Try `/help` for all commands! 😊"""
+
+# ========================
 # ADMIN COMMANDS
 # ========================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1144,7 +1215,7 @@ def main():
     print("✅ Telegram Bot: Ready")
     print("🎨 Image generation: Enabled")
     print("🎵 Music search: Enabled")
-    print("💰 Donation system: Beautiful new interface")
+    print("💰 Donation system: WITH PAYMENT BUTTONS")
     print("🎭 Fun commands: Jokes, Facts, Quotes")
     print("=" * 50)
     
@@ -1171,8 +1242,8 @@ def main():
         app.add_handler(CallbackQueryHandler(button_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        print("✅ StarAI is running with NEW DONATION INTERFACE!")
-        print("💰 Donation menu now has: Tea($3), Coffee($5), Smoothie($10), Cake($20)")
+        print("✅ StarAI is running with PAYMENT BUTTONS!")
+        print("💰 Users now click payment links instead of typing URLs")
         print("🔧 Send /start to begin")
         print("=" * 50)
         
