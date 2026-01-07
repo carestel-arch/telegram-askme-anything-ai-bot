@@ -10,6 +10,7 @@ import hashlib
 import secrets
 import time
 import re
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1366,6 +1367,416 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=reply_markup)
 
 # ========================
+# OTHER BOT COMMANDS
+# ========================
+async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Donation interface"""
+    user = update.effective_user
+    stats = user_db.get_stats()
+    user_total = 0
+    
+    # Get user total if logged in
+    if 'user_id' in context.user_data:
+        user_total = user_db.get_user_total(context.user_data['user_id'])
+    
+    donate_text = f"""
+💰 *SUPPORT STARAI DEVELOPMENT* 💰
+
+Running StarAI costs money for:
+• API keys and AI services
+• Server hosting
+• Development time
+• Maintenance
+
+✨ *Why Support?*
+• Keep StarAI free for everyone
+• Enable new features
+• Get supporter perks
+
+*Community Stats:*
+👥 Supporters: {stats['supporters']}
+💰 Total Raised: ${stats['total_verified']:.2f}
+
+*Your Donations:* ${user_total:.2f}
+
+*Choose amount:*
+"""
+    
+    # Donation amount buttons
+    keyboard = [
+        [InlineKeyboardButton("☕ Tea - $3", callback_data='donate_3'),
+         InlineKeyboardButton("☕ Coffee - $5", callback_data='donate_5')],
+        [InlineKeyboardButton("🥤 Smoothie - $10", callback_data='donate_10'),
+         InlineKeyboardButton("🍰 Cake - $20", callback_data='donate_20')],
+        [InlineKeyboardButton("💰 Custom Amount", callback_data='donate_custom'),
+         InlineKeyboardButton("✅ Check Payment", callback_data='i_donated')],
+        [InlineKeyboardButton("📊 My Donations", callback_data='my_donations'),
+         InlineKeyboardButton("🔙 Back", callback_data='back_to_menu')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(donate_text, parse_mode="Markdown", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(donate_text, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def mydonations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's donation status"""
+    user = update.effective_user
+    
+    # Check if logged in
+    if 'user_id' not in context.user_data:
+        await update.message.reply_text(
+            "🔒 *Login Required*\n\n"
+            "Please login to view your donations:\n"
+            "`/login`\n\n"
+            "Or register:\n"
+            "`/register`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    user_id = context.user_data['user_id']
+    donations = user_db.get_user_donations(user_id)
+    total = user_db.get_user_total(user_id)
+    
+    if donations:
+        response = f"""
+📊 *YOUR DONATIONS*
+
+*Total Verified:* ${total:.2f}
+*Total Transactions:* {len(donations)}
+
+*Recent Donations:*
+"""
+        for i, donation in enumerate(donations[:5], 1):
+            status_icon = "✅" if donation["status"] == "verified" else "⏳"
+            response += f"\n{i}. {status_icon} ${donation['amount']:.2f} - {donation['created_at'][:10]}"
+            if donation["transaction_id"]:
+                response += f"\n   📎 {donation['transaction_id'][:20]}..."
+        
+        if total > 0:
+            response += f"\n\n🎖️ *Supporter Level:* "
+            if total >= 50:
+                response += "Platinum 🏆"
+            elif total >= 20:
+                response += "Gold 🥇"
+            elif total >= 10:
+                response += "Silver 🥈"
+            elif total >= 5:
+                response += "Bronze 🥉"
+            else:
+                response += "Supporter 💝"
+            
+            response += f"\n❤️ Thank you for your support!"
+    else:
+        response = """
+💸 *NO DONATIONS YET*
+
+You haven't made any donations yet.
+
+*Want to support StarAI?*
+Use `/donate` to see how you can help!
+
+*Thank you for being part of the community!* 😊
+"""
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(response, parse_mode="Markdown", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(response, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate image from text"""
+    prompt = ' '.join(context.args)
+    
+    if not prompt:
+        await update.message.reply_text(
+            "🎨 *Usage:* `/image <description>`\n\n*Examples:*\n• `/image sunset over mountains`\n• `/image cute cat in space`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Track stats if logged in
+    if 'user_id' in context.user_data:
+        user_db.update_user_stats(context.user_data['user_id'], 'images_created')
+    
+    msg = await update.message.reply_text(f"✨ *Creating Image:*\n`{prompt}`\n\n⏳ Please wait...", parse_mode="Markdown")
+    image_path = generate_image(prompt)
+    
+    if image_path and os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
+        try:
+            with open(image_path, 'rb') as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=f"🎨 *Generated:* `{prompt}`\n\n✨ Created by StarAI",
+                    parse_mode="Markdown"
+                )
+            try:
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+            except:
+                pass
+        except Exception as e:
+            logger.error(f"Send image error: {e}")
+            await msg.edit_text("❌ Error sending image. Try again!")
+        finally:
+            try:
+                if os.path.exists(image_path):
+                    os.unlink(image_path)
+            except:
+                pass
+    else:
+        await msg.edit_text("❌ Image creation failed. Try a simpler description.")
+
+async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for music"""
+    query = ' '.join(context.args)
+    
+    if not query:
+        await update.message.reply_text(
+            "🎵 *Usage:* `/music <song or artist>`\n\n*Examples:*\n• `/music Bohemian Rhapsody`\n• `/music Taylor Swift`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Track stats if logged in
+    if 'user_id' in context.user_data:
+        user_db.update_user_stats(context.user_data['user_id'], 'music_searches')
+    
+    await update.message.reply_text(f"🔍 *Searching:* `{query}`", parse_mode="Markdown")
+    results = search_music(query)
+    
+    if len(results) > 0 and "Use:" not in results[0]:
+        response = "🎶 *Music Results:*\n\n"
+        for result in results:
+            response += f"{result}\n\n"
+        response += "💡 *Note:* These are YouTube links for listening."
+    else:
+        response = "❌ *No results found.* Try different search terms."
+    
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tell a joke"""
+    joke = random.choice(JOKES)
+    await update.message.reply_text(f"😂 *Joke of the Day:*\n\n{joke}", parse_mode="Markdown")
+
+async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a fun fact"""
+    fact = random.choice(FACTS)
+    await update.message.reply_text(f"💡 *Did You Know?*\n\n{fact}", parse_mode="Markdown")
+
+async def quote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share inspirational quote"""
+    quote = random.choice(QUOTES)
+    await update.message.reply_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear conversation memory"""
+    user = update.effective_user
+    clear_conversation(user.id)
+    await update.message.reply_text("🧹 *Conversation cleared!* Let's start fresh! 😊", parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command"""
+    help_text = """
+🆘 *STARAI HELP CENTER*
+
+👤 **ACCOUNT COMMANDS:**
+`/register` - Create account (5-step process)
+`/login <password>` - Login to account  
+`/profile` - View profile
+`/logout` - Logout
+
+🎨 **MEDIA COMMANDS:**
+`/image <description>` - Generate AI image
+`/music <song/artist>` - Find music links
+
+💰 **SUPPORT COMMANDS:**
+`/donate` - Support StarAI development
+`/mydonations` - Check donations
+
+🎭 **FUN COMMANDS:**
+`/joke` - Get a joke
+`/fact` - Learn a fact  
+`/quote` - Inspiring quote
+`/clear` - Clear chat memory
+
+*Just talk to me naturally!* 😊
+"""
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+# ========================
+# PAYMENT SELECTION FUNCTION
+# ========================
+async def show_payment_options(update: Update, context: ContextTypes.DEFAULT_TYPE, amount):
+    """Show payment buttons after amount selection"""
+    query = update.callback_query
+    
+    # Store the selected amount
+    context.user_data[f"selected_amount_{query.from_user.id}"] = amount
+    
+    payment_text = f"""
+✅ *Selected: ${amount}*
+
+Now choose your payment method:
+
+1. **PayPal** - Secure payment with card or PayPal balance
+2. **Buy Me Coffee** - Simple one-click donation
+
+*After payment, click "✅ I've Paid" below and send your Transaction ID.*
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("💳 PayPal Payment", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+         InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
+        [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
+         InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(payment_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
+
+# ========================
+# BUTTON HANDLERS
+# ========================
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    logger.info(f"Button pressed: {query.data}")
+    
+    # Account buttons
+    if query.data == 'register':
+        await query.edit_message_text(
+            "📝 *START REGISTRATION*\n\n"
+            "Start creating your account with:\n"
+            "`/register`\n\n"
+            "*Benefits:*\n"
+            "• Secure account with password\n"
+            "• Track donations & statistics\n"
+            "• Get supporter perks",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'login':
+        await query.edit_message_text(
+            "🔐 *LOGIN TO ACCOUNT*\n\n"
+            "Login to your account with:\n"
+            "`/login yourpassword`\n\n"
+            "*Example:* `/login MySecurePass123`",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'profile':
+        await profile_command(update, context)
+    
+    # Donation buttons
+    elif query.data.startswith('donate_'):
+        if query.data == 'donate_custom':
+            context.user_data[f"waiting_custom_{query.from_user.id}"] = True
+            await query.edit_message_text(
+                "💰 *CUSTOM DONATION AMOUNT*\n\n"
+                "Please enter the amount you want to donate (in USD):\n\n"
+                "*Examples:*\n"
+                "• `7.50` (for $7.50)\n"
+                "• `15` (for $15)\n"
+                "• `25` (for $25)\n\n"
+                "Enter amount:",
+                parse_mode="Markdown"
+            )
+        else:
+            amount = int(query.data.split('_')[1])
+            await show_payment_options(update, context, amount)
+    
+    elif query.data == 'donate':
+        await donate_command(update, context)
+    
+    elif query.data == 'i_donated':
+        user = query.from_user
+        
+        selected_amount = context.user_data.get(f"selected_amount_{user.id}", 0)
+        
+        if selected_amount == 0:
+            await query.edit_message_text(
+                "❌ *No Amount Selected*\n\n"
+                "Please select a donation amount first!\n\n"
+                "Click 🔙 Back to choose an amount.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Donate", callback_data='donate')]
+                ])
+            )
+            return
+        
+        context.user_data[f"waiting_proof_{user.id}"] = True
+        
+        await query.edit_message_text(
+            f"✅ *PAYMENT CONFIRMATION*\n\n"
+            f"*Selected Amount:* ${selected_amount:.2f}\n\n"
+            "Please send your **Transaction ID** or **Payment Reference**:\n\n"
+            "*Format:* `TXID123456789` or `BMC-ABC123`\n\n"
+            "*How to find:*\n"
+            "• PayPal: Check email or transaction details\n"
+            "• Buy Me Coffee: Check supporter list\n\n"
+            "Or send a screenshot of your payment confirmation.\n\n"
+            "*Note:* Verification may take some time.\n"
+            "Thank you! 🙏",
+            parse_mode="Markdown"
+        )
+    
+    elif query.data == 'my_donations':
+        await mydonations_command(update, context)
+    
+    elif query.data == 'back_to_menu':
+        await start(update, context)
+    
+    # Feature buttons
+    elif query.data == 'create_image':
+        await query.edit_message_text(
+            "🎨 *Image Creation*\n\nSend: `/image <description>`\n\n*Examples:*\n• `/image dragon in forest`\n• `/image cyberpunk city`\n• `/image cute puppy`",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'find_music':
+        await query.edit_message_text(
+            "🎵 *Music Search*\n\nSend: `/music <song or artist>`\n\n*Examples:*\n• `/music Imagine Dragons`\n• `/music chill lofi`\n• `/music 80s hits`",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'get_joke':
+        joke = random.choice(JOKES)
+        await query.edit_message_text(f"😂 *Joke of the Day:*\n\n{joke}", parse_mode="Markdown")
+    elif query.data == 'get_fact':
+        fact = random.choice(FACTS)
+        await query.edit_message_text(f"💡 *Did You Know?*\n\n{fact}", parse_mode="Markdown")
+    elif query.data == 'get_quote':
+        quote = random.choice(QUOTES)
+        await query.edit_message_text(f"📜 *Inspirational Quote:*\n\n{quote}", parse_mode="Markdown")
+    elif query.data == 'chat':
+        await query.edit_message_text(
+            "💬 *Let's Chat!*\n\n"
+            "I'm here to talk about anything! 😊\n\n"
+            "*Just type your message and I'll respond naturally!* 🎭",
+            parse_mode="Markdown"
+        )
+    elif query.data == 'help':
+        await help_command(update, context)
+    
+    else:
+        await query.edit_message_text(
+            "🤔 *Not sure what you clicked!*\n\n"
+            "Try these commands:\n"
+            "• `/image` - Create images\n"
+            "• `/music` - Find songs\n"
+            "• `/joke` - Get a laugh\n"
+            "• `/donate` - Support bot\n\n"
+            "Or just chat with me! 💬",
+            parse_mode="Markdown"
+        )
+
+# ========================
 # GUEST REMINDER FUNCTION
 # ========================
 async def send_guest_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,7 +1856,154 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Track guest message
             user_db.track_guest_activity(user.id)
         
-        # Handle image requests
+        # Check for custom amount donation
+        if context.user_data.get(f"waiting_custom_{user.id}"):
+            context.user_data.pop(f"waiting_custom_{user.id}", None)
+            
+            try:
+                amount = float(user_message)
+                if amount < 1:
+                    await update.message.reply_text("❌ Minimum donation is $1. Please enter a valid amount.")
+                    return
+                
+                payment_text = f"""
+✅ *Selected: ${amount:.2f}*
+
+Now choose your payment method:
+
+1. **PayPal** - Secure payment with card or PayPal balance
+2. **Buy Me Coffee** - Simple one-click donation
+
+*After payment, click "✅ I've Paid" below and send your Transaction ID.*
+"""
+                
+                context.user_data[f"selected_amount_{user.id}"] = amount
+                
+                keyboard = [
+                    [InlineKeyboardButton("💳 PayPal Payment", url='https://www.paypal.com/ncp/payment/HCPVDSSXRL4K8'),
+                     InlineKeyboardButton("☕ Buy Me Coffee", url='https://www.buymeacoffee.com/StarAI')],
+                    [InlineKeyboardButton("✅ I've Paid", callback_data='i_donated'),
+                     InlineKeyboardButton("🔙 Change Amount", callback_data='donate')]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.message.reply_text(payment_text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
+                return
+                
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount. Please enter a number (like 5 or 10.50).")
+                return
+        
+        # Check for payment proof
+        if context.user_data.get(f"waiting_proof_{user.id}"):
+            context.user_data.pop(f"waiting_proof_{user.id}", None)
+            
+            transaction_id = user_message.strip()
+            
+            # Clean transaction ID
+            if user_message.lower().startswith("transaction:"):
+                if ":" in user_message:
+                    transaction_id = user_message.split(":", 1)[1].strip()
+            
+            # Get selected amount
+            amount = context.user_data.get(f"selected_amount_{user.id}", 0)
+            
+            if amount == 0:
+                context.user_data[f"waiting_amount_{user.id}"] = transaction_id
+                await update.message.reply_text(
+                    "💰 *DONATION AMOUNT*\n\n"
+                    "How much did you donate? (in USD)\n\n"
+                    "*Examples:*\n"
+                    "• `5` (for $5)\n"
+                    "• `10.50` (for $10.50)\n"
+                    "• `20` (for $20)\n\n"
+                    "Please enter the amount:",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            # Get user ID (logged in or guest)
+            user_id = context.user_data.get('user_id', user.id)
+            
+            # Save donation
+            success = user_db.add_donation(
+                user_id=user_id,
+                username=user.username or "No username",
+                first_name=user.first_name,
+                amount=amount,
+                transaction_id=transaction_id
+            )
+            
+            if success:
+                response = f"""
+✅ *DONATION RECORDED!*
+
+*Amount:* ${amount:.2f}
+*Transaction ID:* {transaction_id}
+*Date:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+*Status:* ⏳ **Pending Verification**
+
+*What's next:*
+1. Your donation is now recorded
+2. It will be verified manually
+3. You'll get supporter status once verified
+
+*Thank you for supporting StarAI!* 💝
+
+Use `/mydonations` to check your status.
+"""
+                context.user_data.pop(f"selected_amount_{user.id}", None)
+            else:
+                response = "❌ Error recording donation. Please try again."
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            return
+        
+        # Check for amount input
+        if context.user_data.get(f"waiting_amount_{user.id}"):
+            transaction_id = context.user_data.pop(f"waiting_amount_{user.id}")
+            
+            try:
+                amount = float(user_message)
+                
+                # Get user ID
+                user_id = context.user_data.get('user_id', user.id)
+                
+                success = user_db.add_donation(
+                    user_id=user_id,
+                    username=user.username or "No username",
+                    first_name=user.first_name,
+                    amount=amount,
+                    transaction_id=transaction_id
+                )
+                
+                if success:
+                    response = f"""
+✅ *DONATION RECORDED!*
+
+*Amount:* ${amount:.2f}
+*Transaction ID:* {transaction_id}
+*Date:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+*Status:* ⏳ **Pending Verification**
+
+*Thank you for supporting StarAI!* 💝
+"""
+                else:
+                    response = "❌ Error recording donation. Please try again."
+                
+            except ValueError:
+                response = "❌ Invalid amount. Please enter a number (like 5 or 10.50)."
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            return
+        
+        # Show typing indicator
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        
+        # Image requests
         image_keywords = ["create image", "generate image", "draw", "paint", "picture of", "image of"]
         if any(keyword in user_message.lower() for keyword in image_keywords):
             prompt = user_message
@@ -1483,7 +2041,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text("❌ Image creation failed. Try: `/image <description>`")
             return
         
-        # Handle music requests
+        # Music requests
         music_keywords = ["play music", "find song", "music by", "listen to", "song by"]
         if any(keyword in user_message.lower() for keyword in music_keywords):
             query = user_message
@@ -1511,7 +2069,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(response, parse_mode="Markdown")
             return
         
-        # Handle fun commands
+        # Fun commands
         if "joke" in user_message.lower() and ("tell" in user_message.lower() or "give" in user_message.lower()):
             await joke_command(update, context)
             return
@@ -1601,12 +2159,223 @@ def get_fallback_response(user_message):
 *Need help?* Try `/help` for all commands! 😊"""
 
 # ========================
-# OTHER COMMANDS (KEEP FROM PREVIOUS CODE)
+# ADMIN COMMANDS (SIMPLIFIED VERSION)
 # ========================
-# Note: Keep all the other commands (donate_command, mydonations_command, image_command,
-# music_command, joke_command, fact_command, quote_command, clear_command, help_command,
-# button_callback, admin_command) from the previous code as they are.
-# Due to length, I'm not including them again, but they should remain unchanged.
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    admin_ids = [admin_id.strip() for admin_id in ADMIN_IDS if admin_id.strip()]
+    
+    if str(user.id) not in admin_ids and admin_ids:
+        await update.message.reply_text("❌ Admin only.", parse_mode="Markdown")
+        return
+    
+    args = context.args
+    if not args:
+        help_text = """
+🔧 *ADMIN COMMANDS*
+
+👤 **USER MANAGEMENT:**
+`/admin users` - List all registered users
+`/admin stats` - System statistics
+
+💰 **DONATION MANAGEMENT:**
+`/admin donations` - All donations
+`/admin pending` - Pending donations  
+`/admin verify <txid>` - Verify donation
+
+📊 **SYSTEM:**
+`/admin dbstats` - Database statistics
+"""
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+        return
+    
+    cmd = args[0].lower()
+    
+    if cmd == "users":
+        try:
+            conn = sqlite3.connect(user_db.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM users')
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT id, telegram_id, username, first_name, email, 
+                       created_at, account_type
+                FROM users 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            ''')
+            
+            users = cursor.fetchall()
+            conn.close()
+            
+            if not users:
+                response = "📭 *No registered users yet.*"
+            else:
+                response = f"👥 *REGISTERED USERS*\n"
+                response += f"*Total Users:* {total_users}\n\n"
+                
+                for i, user in enumerate(users, 1):
+                    user_id, telegram_id, username, first_name, email, created_at, account_type = user
+                    
+                    response += f"*{i}. {first_name}*"
+                    if username:
+                        response += f" (@{username})"
+                    
+                    response += f"\n   ├─ ID: `{user_id}`"
+                    response += f"\n   ├─ Telegram: `{telegram_id}`"
+                    if email:
+                        response += f"\n   ├─ Email: {email}"
+                    response += f"\n   ├─ Type: {account_type.title()}"
+                    response += f"\n   └─ Joined: {created_at[:10]}\n\n"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Admin users error: {e}")
+            await update.message.reply_text("❌ Error fetching users.", parse_mode="Markdown")
+    
+    elif cmd == "stats":
+        stats = user_db.get_stats()
+        
+        response = f"""
+📊 *SYSTEM STATISTICS*
+
+👥 *User Statistics:*
+• Total Users: {stats['total_users']}
+• Active Guests: {stats['active_guests']}
+
+💰 *Donation Statistics:*
+• Total Supporters: {stats['supporters']}
+• Total Raised: ${stats['total_verified']:.2f}
+• Pending: ${stats['total_pending']:.2f}
+
+✅ Bot is running normally!
+"""
+        await update.message.reply_text(response, parse_mode="Markdown")
+    
+    elif cmd == "donations":
+        try:
+            conn = sqlite3.connect(user_db.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM donations')
+            total_donations = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT d.id, d.user_id, u.first_name, u.username, 
+                       d.amount, d.status, d.transaction_id, d.created_at
+                FROM donations d
+                LEFT JOIN users u ON d.user_id = u.id
+                ORDER BY d.created_at DESC 
+                LIMIT 10
+            ''')
+            
+            donations = cursor.fetchall()
+            conn.close()
+            
+            if not donations:
+                response = "💸 *No donations yet.*"
+            else:
+                response = f"💰 *ALL DONATIONS*\n"
+                response += f"*Total Donations:* {total_donations}\n\n"
+                
+                for i, donation in enumerate(donations, 1):
+                    donation_id, user_id, first_name, username, amount, status, txid, created_at = donation
+                    
+                    status_icon = "✅" if status == "verified" else "⏳"
+                    response += f"{i}. {status_icon} *${amount:.2f}*\n"
+                    response += f"   ├─ By: {first_name or 'Guest'}"
+                    if username:
+                        response += f" (@{username})"
+                    response += f"\n   ├─ User ID: {user_id}"
+                    response += f"\n   ├─ TXID: {txid[:15]}..." if txid else "\n   ├─ TXID: Not provided"
+                    response += f"\n   └─ Date: {created_at[:16]}\n\n"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Admin donations error: {e}")
+            await update.message.reply_text("❌ Error fetching donations.", parse_mode="Markdown")
+    
+    elif cmd == "pending":
+        conn = sqlite3.connect(user_db.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM donations WHERE status = "pending" ORDER BY created_at DESC')
+        pending = cursor.fetchall()
+        conn.close()
+        
+        if not pending:
+            await update.message.reply_text("✅ No pending donations.", parse_mode="Markdown")
+            return
+        
+        response = "⏳ *PENDING DONATIONS*\n\n"
+        for i, donation in enumerate(pending):
+            response += f"{i+1}. User {donation[1]} ({donation[3]})\n"
+            response += f"   Amount: ${donation[4]:.2f}\n"
+            response += f"   TXID: {donation[6]}\n"
+            response += f"   Date: {donation[7][:16]}\n\n"
+        
+        response += "*To verify:* `/admin verify TXID`"
+        await update.message.reply_text(response, parse_mode="Markdown")
+    
+    elif cmd == "verify":
+        if len(args) < 2:
+            await update.message.reply_text("❌ Usage: `/admin verify TXID`", parse_mode="Markdown")
+            return
+        
+        transaction_id = args[1]
+        success = user_db.verify_donation(transaction_id)
+        
+        if success:
+            await update.message.reply_text(f"✅ Donation `{transaction_id}` verified!", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ Could not verify donation `{transaction_id}`", parse_mode="Markdown")
+    
+    elif cmd == "dbstats":
+        try:
+            conn = sqlite3.connect(user_db.db_file)
+            cursor = conn.cursor()
+            
+            tables = ['users', 'donations', 'supporters', 'user_stats', 'sessions', 'guest_tracking']
+            stats = []
+            
+            for table in tables:
+                cursor.execute(f'SELECT COUNT(*) FROM {table}')
+                count = cursor.fetchone()[0]
+                stats.append(f"• {table.title()}: {count} rows")
+            
+            import os
+            db_size = os.path.getsize(user_db.db_file) if os.path.exists(user_db.db_file) else 0
+            db_size_mb = db_size / (1024 * 1024)
+            
+            conn.close()
+            
+            response = f"""
+🗄️ *DATABASE STATISTICS*
+
+*Table Sizes:*
+{chr(10).join(stats)}
+
+*File Information:*
+• Size: {db_size_mb:.2f} MB
+
+*Bot Status:*
+• Telegram: ✅ Connected
+• Groq AI: {'✅ Enabled' if client else '❌ Disabled'}
+• Image Gen: ✅ Pollinations.ai + Craiyon
+• Music Search: ✅ YouTube
+"""
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Admin dbstats error: {e}")
+            await update.message.reply_text("❌ Error fetching database stats.", parse_mode="Markdown")
+    
+    else:
+        await update.message.reply_text("❌ Unknown admin command. Use `/admin` for help.", parse_mode="Markdown")
 
 # ========================
 # MAIN FUNCTION
@@ -1662,7 +2431,7 @@ def main():
             ("profile", profile_command),
         ]
         
-        # Bot commands (add the rest from previous code)
+        # Bot commands
         bot_commands = [
             ("start", start),
             ("help", help_command),
@@ -1698,5 +2467,4 @@ def main():
         print(f"❌ Failed to start: {e}")
 
 if __name__ == '__main__':
-    import asyncio
     main()
